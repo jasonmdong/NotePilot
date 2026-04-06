@@ -1,4 +1,4 @@
-# accompy
+# Accompy
 
 A real-time piano accompanist. You play the right-hand melody — accompy tracks your tempo and plays the left hand automatically.
 
