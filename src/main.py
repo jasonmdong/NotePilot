@@ -24,9 +24,9 @@ import queue
 import tty
 import termios
 import rtmidi
-from src.tracker import ScoreTracker
-from src.accompanist import Accompanist
-from src.synth import play_note as synth_play_note
+from .tracker import ScoreTracker
+from .accompanist import Accompanist
+from .synth import play_note as synth_play_note
 
 
 def load_score(name: str):
@@ -61,19 +61,30 @@ def get_score_name() -> str:
 NOTE_ON_MASK = 0x90
 NOTE_OFF_MASK = 0x80
 
-# Computer keyboard → MIDI note mapping (3 octaves of white keys)
+# Computer keyboard → MIDI note mapping
 #
-#   Low  (C3–B3):  z x c v b n m
-#   Mid  (C4–B4):  a s d f g h j
-#   High (C5–B5):  q w e r t y u   and  i = C6
+#   White keys:        z x c v b n m  (C3–B3)
+#                      a s d f g h j  (C4–B4)
+#                      q w e r t y u  (C5–B5)  i=C6
+#
+#   Sharps (Shift+white key):
+#                      Z X   V B N    (C#3 D#3  F#3 G#3 A#3)
+#                      A S   F G H    (C#4 D#4  F#4 G#4 A#4)
+#                      Q W   R T Y    (C#5 D#5  F#5 G#5 A#5)
 #
 KEY_TO_PITCH = {
-    # C3 octave
+    # C3 octave — whites
     'z': 48, 'x': 50, 'c': 52, 'v': 53, 'b': 55, 'n': 57, 'm': 59,
-    # C4 octave
+    # C3 octave — sharps (Shift)
+    'Z': 49, 'X': 51,           'V': 54, 'B': 56, 'N': 58,
+    # C4 octave — whites
     'a': 60, 's': 62, 'd': 64, 'f': 65, 'g': 67, 'h': 69, 'j': 71,
-    # C5 octave
+    # C4 octave — sharps (Shift)
+    'A': 61, 'S': 63,           'F': 66, 'G': 68, 'H': 70,
+    # C5 octave — whites
     'q': 72, 'w': 74, 'e': 76, 'r': 77, 't': 79, 'y': 81, 'u': 83,
+    # C5 octave — sharps (Shift)
+    'Q': 73, 'W': 75,           'R': 78, 'T': 80, 'Y': 82,
     # C6
     'i': 84,
 }
@@ -135,9 +146,9 @@ def _read_keys(note_queue: queue.Queue, stop_event: threading.Event):
 def prompt_bpm() -> float:
     while True:
         try:
-            val = input("Starting BPM (press Enter for 100): ").strip()
+            val = input("Starting BPM (press Enter for 60): ").strip()
             if val == "":
-                return 100.0
+                return 60.0
             bpm = float(val)
             if 20 <= bpm <= 300:
                 return bpm

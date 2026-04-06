@@ -43,14 +43,25 @@ def _corpus_index():
 
 SCORES_DIR = "scores"
 
+# In-memory score cache: name → (mtime, module)
+# Invalidated automatically when the .py file changes on disk.
+_score_cache: dict[str, tuple[float, object]] = {}
+
 
 def load_score_module(name: str):
     path = os.path.join(SCORES_DIR, f"{name}.py")
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail=f"Score '{name}' not found")
+
+    mtime = os.path.getmtime(path)
+    cached = _score_cache.get(name)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
     spec = importlib.util.spec_from_file_location("_score", path)
     mod  = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    _score_cache[name] = (mtime, mod)
     return mod
 
 
@@ -90,12 +101,47 @@ def list_scores():
 def get_score(name: str):
     mod = load_score_module(name)
     has_sheet = os.path.exists(os.path.join(SCORES_DIR, f"{name}.html"))
+
+    # New format: PARTS list
+    if hasattr(mod, "PARTS"):
+        parts = mod.PARTS
+    else:
+        # Legacy format (e.g. twinkle.py) — wrap in a single part
+        parts = [
+            {"name": "Melody",        "notes": [[p, b] for p, b in mod.RIGHT_HAND]},
+            {"name": "Accompaniment", "notes": [[p, b] for p, b in mod.LEFT_HAND]},
+        ]
+
     return {
-        "name":       name,
+        "name":      name,
+        "parts":     parts,
+        "has_sheet": has_sheet,
+        # keep legacy fields for CLI compatibility
         "right_hand": mod.RIGHT_HAND,
         "left_hand":  mod.LEFT_HAND,
-        "has_sheet":  has_sheet,
     }
+
+
+@app.delete("/api/scores/{name}")
+def delete_score(name: str):
+    removed = []
+    for ext in (".py", ".html"):
+        path = os.path.join(SCORES_DIR, f"{name}{ext}")
+        if os.path.exists(path):
+            os.remove(path)
+            removed.append(path)
+    _score_cache.pop(name, None)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"Score '{name}' not found")
+    return {"deleted": removed}
+
+
+@app.get("/api/scores/{name}/meta")
+def get_score_meta(name: str):
+    path = os.path.join(SCORES_DIR, f"{name}.py")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"Score '{name}' not found")
+    return {"name": name, "mtime": os.path.getmtime(path)}
 
 
 @app.get("/api/scores/{name}/sheet")
@@ -127,42 +173,38 @@ def convert_score(req: ConvertRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    def midi_pitch(element):
-        if isinstance(element, note.Note):
-            return element.pitch.midi
-        if isinstance(element, chord.Chord):
-            return max(n.pitch.midi for n in element.notes)
-        return None
-
-    right, left = [], []
-    parts = score.parts
-    if len(parts) < 1:
+    score_parts = score.parts
+    if len(score_parts) < 1:
         raise HTTPException(status_code=400, detail="No parts found in score")
 
-    for el in parts[0].flatten().notesAndRests:
-        p = midi_pitch(el)
-        if p is not None:
-            right.append([p, float(el.offset)])
-
-    if len(parts) >= 2:
-        for el in parts[1].flatten().notesAndRests:
+    parts_data = []
+    for p in score_parts:
+        part_name = p.partName or f"Part {len(parts_data) + 1}"
+        notes = []
+        for el in p.flatten().notesAndRests:
             if isinstance(el, note.Note):
-                left.append([[el.pitch.midi], float(el.offset)])
+                notes.append([el.pitch.midi, float(el.offset)])
             elif isinstance(el, chord.Chord):
-                left.append([sorted(n.pitch.midi for n in el.notes), float(el.offset)])
-
-    right.sort(key=lambda x: x[1])
-    left.sort(key=lambda x: x[1])
+                top = max(n.pitch.midi for n in el.notes)
+                notes.append([top, float(el.offset)])
+        notes.sort(key=lambda x: x[1])
+        parts_data.append({"name": part_name, "notes": notes})
 
     # Write .py
     lines = [
         f'# Auto-generated: {req.corpus_path}',
-        f'RIGHT_HAND = {right!r}',
-        f'LEFT_HAND  = {left!r}',
+        f'PARTS = {parts_data!r}',
+        f'RIGHT_HAND = PARTS[0]["notes"] if PARTS else []',
+        f'LEFT_HAND  = []',
+        f'for _p in PARTS[1:]:',
+        f'    LEFT_HAND.extend([[n[0] if isinstance(n[0], list) else [n[0]], n[1]] for n in _p["notes"]])',
         f'LEFT_HAND.sort(key=lambda x: x[1])',
     ]
     with open(out_py, "w") as f:
         f.write("\n".join(lines) + "\n")
+
+    # Bust the in-memory cache so the next GET picks up the new file
+    _score_cache.pop(name, None)
 
     # Write .html via verovio
     try:
@@ -183,8 +225,9 @@ def convert_score(req: ConvertRequest):
     except Exception:
         pass
 
-    return {"name": name, "right_hand_notes": len(right),
-            "left_hand_events": len(left), "has_sheet": os.path.exists(out_html)}
+    total_notes = sum(len(p["notes"]) for p in parts_data)
+    return {"name": name, "parts": len(parts_data), "total_notes": total_notes,
+            "has_sheet": os.path.exists(out_html)}
 
 
 # Serve static files and fallback to index.html

@@ -52,13 +52,19 @@
 
   <div class="progress-bar"><div id="progress-fill" class="progress-fill" style="width:0%"></div></div>
 
+  <!-- Part picker -->
+  <div id="part-picker" class="part-picker" style="display:none">
+    <h4>Choose your part</h4>
+    <div id="part-buttons" class="part-buttons"></div>
+  </div>
+
   <div class="play-top">
 
     <!-- Controls -->
     <div class="controls">
       <label>Starting tempo</label>
       <div class="bpm-row">
-        <input id="bpm-input" type="number" value="100" min="20" max="300">
+        <input id="bpm-input" type="number" value="60" min="20" max="300">
         <span style="color:#555;font-size:.85rem">BPM</span>
       </div>
       <div style="display:flex;gap:.6rem;margin-top:1rem">

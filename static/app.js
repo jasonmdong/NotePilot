@@ -1,17 +1,29 @@
 // ── Key → MIDI pitch mapping ────────────────────────────────────────────────
 const KEY_MAP = {
-  z:48,x:50,c:52,v:53,b:55,n:57,m:59,  // C3–B3
-  a:60,s:62,d:64,f:65,g:67,h:69,j:71,  // C4–B4
-  q:72,w:74,e:76,r:77,t:79,y:81,u:83,  // C5–B5
-  i:84,                                  // C6
+  // C3 whites
+  z:48,x:50,c:52,v:53,b:55,n:57,m:59,
+  // C3 sharps (Shift)
+  Z:49,X:51,        V:54,B:56,N:58,
+  // C4 whites
+  a:60,s:62,d:64,f:65,g:67,h:69,j:71,
+  // C4 sharps (Shift)
+  A:61,S:63,        F:66,G:68,H:70,
+  // C5 whites
+  q:72,w:74,e:76,r:77,t:79,y:81,u:83,
+  // C5 sharps (Shift)
+  Q:73,W:75,        R:78,T:80,Y:82,
+  // C6
+  i:84,
 };
+// Which white keys have a sharp (Shift version)
+const HAS_SHARP = new Set(['z','x','v','b','n','a','s','f','g','h','q','w','r','t','y']);
 const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 function pitchName(midi) { return NOTE_NAMES[midi % 12] + (Math.floor(midi/12)-1); }
 
 // ── Web Audio Synth ─────────────────────────────────────────────────────────
 let _audioCtx = null;
 function audioCtx() {
-  if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (!_audioCtx) _audioCtx = new AudioContext();
   return _audioCtx;
 }
 
@@ -165,9 +177,12 @@ async function loadScoreList() {
   state.scores = scores;
   const grid = document.getElementById('score-grid');
   grid.innerHTML = scores.map(name => `
-    <div class="score-card" onclick="openScore('${name}')">
-      <h3>${formatName(name)}</h3>
-      <small>${name}</small>
+    <div class="score-card" id="card-${name}">
+      <div onclick="openScore('${name}')" style="flex:1;cursor:pointer">
+        <h3>${formatName(name)}</h3>
+        <small>${name}</small>
+      </div>
+      <button class="delete-btn" onclick="deleteScore(event, '${name}')" title="Remove">✕</button>
     </div>
   `).join('');
 }
@@ -177,9 +192,31 @@ function formatName(name) {
 }
 
 // ── Play screen ───────────────────────────────────────────────────────────────
+async function fetchScore(name) {
+  const CACHE_KEY = `accompy_score_${name}`;
+  try {
+    // Cheap mtime check first
+    const { mtime } = await api(`/api/scores/${name}/meta`);
+    const cached = localStorage.getItem(CACHE_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (parsed._mtime === mtime) return parsed;
+    }
+    // Cache miss — fetch full data
+    const data = await api(`/api/scores/${name}`);
+    data._mtime = mtime;
+    localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+    return data;
+  } catch {
+    // Fallback: fetch without caching
+    return api(`/api/scores/${name}`);
+  }
+}
+
 async function openScore(name) {
-  const data = await api(`/api/scores/${name}`);
+  const data = await fetchScore(name);
   state.current = data;
+  state.selectedPart = 0;
 
   document.getElementById('play-title').textContent = formatName(name);
   document.getElementById('progress-fill').style.width = '0%';
@@ -199,10 +236,52 @@ async function openScore(name) {
     placeholder.style.display = 'block';
   }
 
-  buildKeyboard(data.right_hand);
+  // Part picker
+  const parts = data.parts || [];
+  const picker = document.getElementById('part-picker');
+  const btns   = document.getElementById('part-buttons');
+  if (parts.length > 1) {
+    btns.innerHTML = parts.map((p, i) => `
+      <button class="part-btn${i === 0 ? ' selected' : ''}"
+              onclick="selectPart(${i})"
+              id="part-btn-${i}">
+        ${p.name}
+      </button>`).join('');
+    picker.style.display = 'block';
+  } else {
+    picker.style.display = 'none';
+  }
+
+  buildKeyboard(getRightHand());
   showScreen('play-screen');
   document.getElementById('start-btn').disabled = false;
   document.getElementById('stop-btn').disabled  = true;
+}
+
+function selectPart(idx) {
+  state.selectedPart = idx;
+  document.querySelectorAll('.part-btn').forEach((b, i) =>
+    b.classList.toggle('selected', i === idx));
+  buildKeyboard(getRightHand());
+  document.getElementById('next-note-display').textContent = '—';
+}
+
+function getRightHand() {
+  const parts = state.current?.parts;
+  if (parts && parts.length > 0) return parts[state.selectedPart ?? 0].notes;
+  return state.current?.right_hand || [];
+}
+
+function getLeftHand() {
+  const parts = state.current?.parts;
+  if (!parts || parts.length === 0) return state.current?.left_hand || [];
+  const idx = state.selectedPart ?? 0;
+  // Merge all parts except the selected one
+  const left = [];
+  parts.forEach((p, i) => { if (i !== idx) left.push(...p.notes); });
+  left.sort((a, b) => a[1] - b[1]);
+  // Wrap pitches as arrays for the accompanist
+  return left.map(n => [Array.isArray(n[0]) ? n[0] : [n[0]], n[1]]);
 }
 
 // ── Keyboard visualiser ───────────────────────────────────────────────────────
@@ -214,38 +293,59 @@ const KB_ROWS = [
 
 function buildKeyboard(rightHand) {
   const nextPitch = rightHand[0]?.[0];
-  const pitchToKey = Object.fromEntries(Object.entries(KEY_MAP).map(([k,v])=>[v,k]));
 
   KB_ROWS.forEach((row, ri) => {
     const el = document.getElementById(`kb-row-${ri}`);
     el.innerHTML = row.map(key => {
-      const midi  = KEY_MAP[key];
-      const name  = pitchName(midi);
-      const isNext = midi === nextPitch;
-      return `<div class="kb-key${isNext?' next':''}" id="kbkey-${key}">
-        <span class="key-char">${key}</span>
-        <span class="note-name">${name}</span>
+      const midi     = KEY_MAP[key];
+      const name     = pitchName(midi);
+      const isNext   = midi === nextPitch;
+      const sharpKey = HAS_SHARP.has(key) ? key.toUpperCase() : null;
+      const sharpMidi = sharpKey ? KEY_MAP[sharpKey] : null;
+      const sharpName = sharpMidi ? pitchName(sharpMidi) : null;
+      const isNextSharp = sharpMidi === nextPitch;
+
+      const sharpBadge = sharpKey
+        ? `<div class="kb-sharp${isNextSharp ? ' next' : ''}" id="kbkey-${sharpKey}">
+             <span class="sharp-char">⇧${key}</span>
+             <span class="sharp-note">${sharpName}</span>
+           </div>`
+        : `<div class="kb-sharp-empty"></div>`;
+
+      return `<div class="kb-key-wrap">
+        ${sharpBadge}
+        <div class="kb-key${isNext ? ' next' : ''}" id="kbkey-${key}">
+          <span class="key-char">${key}</span>
+          <span class="note-name">${name}</span>
+        </div>
       </div>`;
     }).join('');
   });
 }
 
+// Build reverse map: midi → key (prefer lowercase/white keys)
+function buildPitchToKey() {
+  const map = {};
+  // Add sharps first so whites overwrite for natural notes
+  for (const [k, v] of Object.entries(KEY_MAP)) map[v] = k;
+  return map;
+}
+
 function highlightKey(key, on) {
   const el = document.getElementById(`kbkey-${key}`);
-  if (el) { el.classList.toggle('active', on); }
+  if (el) el.classList.toggle('active', on);
 }
 
 function updateNextKey(rightHand, position) {
-  // Clear all 'next' highlights
-  document.querySelectorAll('.kb-key.next').forEach(el => el.classList.remove('next'));
+  document.querySelectorAll('.kb-key.next, .kb-sharp.next')
+    .forEach(el => el.classList.remove('next'));
   if (position >= rightHand.length) return;
+
   const midi = rightHand[position][0];
-  const pitchToKey = Object.fromEntries(Object.entries(KEY_MAP).map(([k,v])=>[v,k]));
-  const key = pitchToKey[midi];
+  const key  = buildPitchToKey()[midi];
   if (key) document.getElementById(`kbkey-${key}`)?.classList.add('next');
 
-  const name = pitchName(midi);
-  document.getElementById('next-note-display').textContent = name;
+  document.getElementById('next-note-display').textContent = pitchName(midi);
 }
 
 // ── Start / Stop ──────────────────────────────────────────────────────────────
@@ -254,17 +354,18 @@ function startPlaying() {
 
   const bpm        = parseFloat(document.getElementById('bpm-input').value) || 100;
   const initialBps = bpm / 60;
-  const { right_hand, left_hand } = state.current;
+  const right = getRightHand();
+  const left  = getLeftHand();
 
-  state.tracker     = new Tracker(right_hand, initialBps);
-  state.accompanist = new Accompanist(left_hand, right_hand, initialBps);
+  state.tracker     = new Tracker(right, initialBps);
+  state.accompanist = new Accompanist(left, right, initialBps);
   state.accompanist.start();
   state.playing = true;
 
   document.getElementById('start-btn').disabled = true;
   document.getElementById('stop-btn').disabled  = false;
 
-  updateNextKey(right_hand, 0);
+  updateNextKey(right, 0);
   enableMidi();
 }
 
@@ -280,11 +381,9 @@ function stopPlaying() {
 function handleNote(midi) {
   if (!state.playing || !state.tracker) return;
   playNote(midi);
-  highlightKey(Object.entries(KEY_MAP).find(([,v])=>v===midi)?.[0], true);
-  setTimeout(() => {
-    const k = Object.entries(KEY_MAP).find(([,v])=>v===midi)?.[0];
-    highlightKey(k, false);
-  }, 120);
+  const k = buildPitchToKey()[midi];
+  highlightKey(k, true);
+  setTimeout(() => highlightKey(k, false), 120);
 
   const beat = state.tracker.onNote(midi);
   if (beat !== null) {
@@ -294,7 +393,7 @@ function handleNote(midi) {
     document.getElementById('tempo-val').textContent = Math.round(bps * 60) + ' BPM';
     document.getElementById('progress-fill').style.width =
       (state.tracker.progress() * 100).toFixed(1) + '%';
-    updateNextKey(state.current.right_hand, state.tracker.position);
+    updateNextKey(getRightHand(), state.tracker.position);
   }
 
   if (state.tracker.isFinished()) stopPlaying();
@@ -304,7 +403,7 @@ function handleNote(midi) {
 document.addEventListener('keydown', e => {
   if (e.repeat) return;
   if (['INPUT','TEXTAREA'].includes(e.target.tagName)) return;
-  const midi = KEY_MAP[e.key.toLowerCase()];
+  const midi = KEY_MAP[e.key];  // preserve case — uppercase = sharp
   if (midi !== undefined) { e.preventDefault(); handleNote(midi); }
 });
 
@@ -320,6 +419,16 @@ function enableMidi() {
     }
     document.getElementById('midi-status').textContent = 'MIDI: connected';
   }).catch(() => {});
+}
+
+// ── Delete piece ─────────────────────────────────────────────────────────────
+async function deleteScore(e, name) {
+  e.stopPropagation();
+  if (!confirm(`Remove "${formatName(name)}"?`)) return;
+  await api(`/api/scores/${name}`, { method: 'DELETE' });
+  localStorage.removeItem(`accompy_score_${name}`);
+  document.getElementById(`card-${name}`)?.remove();
+  state.scores = state.scores.filter(s => s !== name);
 }
 
 // ── Add piece modal ───────────────────────────────────────────────────────────
@@ -393,7 +502,7 @@ async function addPiece(corpusPath, safeName) {
   item.querySelector('button').textContent = 'Converting…';
 
   try {
-    const result = await api('/api/convert', {
+    await api('/api/convert', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ corpus_path: corpusPath, name: safeName }),

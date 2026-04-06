@@ -25,64 +25,55 @@ def beat_to_float(beat) -> float:
     return float(beat)
 
 
-def extract_right_hand(part) -> list[tuple[int, float]]:
-    """Return [(midi_pitch, offset_in_quarters), ...] for every note in the part."""
+def extract_melody(part) -> list:
+    """Return [[midi_pitch, offset], ...] — top note of each chord, no rests."""
     notes = []
-    for element in part.flatten().notesAndRests:
-        if isinstance(element, note.Note):
-            notes.append((element.pitch.midi, beat_to_float(element.offset)))
-        elif isinstance(element, chord.Chord):
-            # For melody parts take the highest pitch (soprano voice)
-            top = max(n.pitch.midi for n in element.notes)
-            notes.append((top, beat_to_float(element.offset)))
-        # rests are skipped
+    for el in part.flatten().notesAndRests:
+        if isinstance(el, note.Note):
+            notes.append([el.pitch.midi, beat_to_float(el.offset)])
+        elif isinstance(el, chord.Chord):
+            top = max(n.pitch.midi for n in el.notes)
+            notes.append([top, beat_to_float(el.offset)])
     notes.sort(key=lambda x: x[1])
     return notes
 
 
-def extract_left_hand(part) -> list[tuple[list[int], float]]:
-    """Return [([midi_pitches], offset_in_quarters), ...] for every event."""
+def extract_accompaniment(part) -> list:
+    """Return [[pitches_list, offset], ...] — all notes/chords, no rests."""
     events = []
-    for element in part.flatten().notesAndRests:
-        if isinstance(element, note.Note):
-            events.append(([element.pitch.midi], beat_to_float(element.offset)))
-        elif isinstance(element, chord.Chord):
-            pitches = sorted(n.pitch.midi for n in element.notes)
-            events.append((pitches, beat_to_float(element.offset)))
+    for el in part.flatten().notesAndRests:
+        if isinstance(el, note.Note):
+            events.append([[el.pitch.midi], beat_to_float(el.offset)])
+        elif isinstance(el, chord.Chord):
+            events.append([sorted(n.pitch.midi for n in el.notes), beat_to_float(el.offset)])
     events.sort(key=lambda x: x[1])
     return events
 
 
-def write_score_py(right: list, left: list, out_path: str, title: str):
+def write_score_py(parts_data: list, out_path: str, title: str):
+    """
+    parts_data: [{"name": str, "notes": [[pitch, beat], ...]}, ...]
+    Writes PARTS, and also RIGHT_HAND/LEFT_HAND defaulting to part 0 / rest.
+    """
+    # Default RIGHT_HAND = part 0 melody, LEFT_HAND = all other parts merged
+    right = parts_data[0]['notes'] if parts_data else []
+    left  = []
+    for p in parts_data[1:]:
+        left.extend([[n[0] if isinstance(n[0], list) else [n[0]], n[1]] for n in p['notes']])
+    left.sort(key=lambda x: x[1])
+
     lines = [
-        f'"""',
-        f'Auto-generated score: {title}',
+        f'# Auto-generated score: {title}',
+        f'# Beat positions are in quarter-note units from the start.',
         f'',
-        f'Right hand: melody (treble staff)',
-        f'Left hand:  accompaniment (bass staff)',
-        f'Beat positions are in quarter-note units from the start of the piece.',
-        f'"""',
+        f'# All parts — each note is [midi_pitch, beat]',
+        f'PARTS = {parts_data!r}',
         f'',
-        f'# Right-hand melody: list of (midi_pitch, beat_position)',
-        f'RIGHT_HAND = [',
-    ]
-
-    for pitch, offset in right:
-        lines.append(f'    ({pitch}, {offset:.4f}),')
-
-    lines += [
-        f']',
-        f'',
-        f'# Left-hand accompaniment: list of (midi_pitches, beat_position)',
-        f'LEFT_HAND = [',
-    ]
-
-    for pitches, offset in left:
-        lines.append(f'    ({pitches!r}, {offset:.4f}),')
-
-    lines += [
-        f']',
-        f'',
+        f'# Defaults: part 0 = melody, remaining parts = accompaniment',
+        f'RIGHT_HAND = PARTS[0]["notes"] if PARTS else []',
+        f'LEFT_HAND  = []',
+        f'for _p in PARTS[1:]:',
+        f'    LEFT_HAND.extend([[n[0] if isinstance(n[0], list) else [n[0]], n[1]] for n in _p["notes"]])',
         f'LEFT_HAND.sort(key=lambda x: x[1])',
     ]
 
@@ -90,8 +81,8 @@ def write_score_py(right: list, left: list, out_path: str, title: str):
         f.write('\n'.join(lines) + '\n')
 
     print(f"Written to {out_path}")
-    print(f"  Right hand notes : {len(right)}")
-    print(f"  Left hand events : {len(left)}")
+    for p in parts_data:
+        print(f"  {p['name']}: {len(p['notes'])} notes")
 
 
 def main():
@@ -111,22 +102,20 @@ def main():
         mxl_path = args.input
         score = converter.parse(args.input)
 
-    parts = score.parts
-    print(f"Found {len(parts)} part(s):")
-    for i, p in enumerate(parts):
+    score_parts = score.parts
+    print(f"Found {len(score_parts)} part(s):")
+    for i, p in enumerate(score_parts):
         print(f"  [{i}] {p.partName or '(unnamed)'}")
 
-    if len(parts) == 0:
+    if len(score_parts) == 0:
         print("No parts found — is this a valid MusicXML file?")
         sys.exit(1)
 
-    right = extract_right_hand(parts[0])
-
-    left = []
-    if len(parts) >= 2:
-        left = extract_left_hand(parts[1])
-    else:
-        print("Only one part found; left hand will be empty.")
+    parts_data = []
+    for p in score_parts:
+        part_name = p.partName or f"Part {len(parts_data) + 1}"
+        notes = extract_melody(p)
+        parts_data.append({"name": part_name, "notes": notes})
 
     title = score.metadata.title if score.metadata and score.metadata.title else args.input
 
@@ -135,12 +124,11 @@ def main():
     else:
         import re, os
         raw = args.name if args.name else args.input
-        # Derive a filesystem-safe name from the input path
         name = os.path.splitext(os.path.basename(raw))[0]
         name = re.sub(r'[^a-zA-Z0-9_]+', '_', name).strip('_').lower()
         out_path = os.path.join("scores", f"{name}.py")
 
-    write_score_py(right, left, out_path, title)
+    write_score_py(parts_data, out_path, title)
 
     score_name = os.path.splitext(os.path.basename(out_path))[0]
     print(f"\nPlay it with:  python main.py --score {score_name}")

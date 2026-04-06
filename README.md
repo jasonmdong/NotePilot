@@ -22,13 +22,13 @@ Open [http://localhost:8000](http://localhost:8000) to browse scores, add new pi
 
 ```bash
 # Computer keyboard
-python main.py --keyboard --score twinkle
+python -m src.main --keyboard --score twinkle
 
 # USB MIDI keyboard (e.g. Yamaha P-71)
-python main.py --score mozart_k545
+python -m src.main --score mozart_k545
 
 # List available scores
-python main.py --list
+python -m src.main --list
 ```
 
 You'll be prompted for a starting BPM. The left hand plays between your notes and waits at each melody note until you play it.
@@ -49,13 +49,13 @@ Or via CLI:
 
 ```bash
 # Built-in corpus
-python convert_score.py corpus:mozart/k545/movement1_exposition --name mozart_k545
+python -m src.convert_score corpus:mozart/k545/movement1_exposition --name mozart_k545
 
 # Downloaded MusicXML
-python convert_score.py ~/Downloads/mysong.mxl --name mysong
+python -m src.convert_score ~/Downloads/mysong.mxl --name mysong
 
 # Show notes + keyboard keys for a score
-python convert_score.py --show mozart_k545
+python -m src.convert_score --show mozart_k545
 ```
 
 Free MusicXML sources: [IMSLP](https://imslp.org) · [Flat.io](https://flat.io)
@@ -63,10 +63,11 @@ Free MusicXML sources: [IMSLP](https://imslp.org) · [Flat.io](https://flat.io)
 ## Structure
 
 ```
-main.py            # CLI entry point
-server.py          # Web server
-convert_score.py   # MusicXML → scores/ converter
+run.py             # Start the web server
 src/
+  main.py          # CLI entry point
+  server.py        # Web server
+  convert_score.py # MusicXML → scores/ converter
   tracker.py       # Score position + tempo tracking
   accompanist.py   # Left-hand scheduler
   synth.py         # Software synthesizer
