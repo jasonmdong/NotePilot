@@ -1,22 +1,15 @@
-// ── Key → MIDI pitch mapping ────────────────────────────────────────────────
-const KEY_MAP = {
-  // C3 whites
-  z:48,x:50,c:52,v:53,b:55,n:57,m:59,
-  // C3 sharps (Shift)
-  Z:49,X:51,        V:54,B:56,N:58,
-  // C4 whites
-  a:60,s:62,d:64,f:65,g:67,h:69,j:71,
-  // C4 sharps (Shift)
-  A:61,S:63,        F:66,G:68,H:70,
-  // C5 whites
-  q:72,w:74,e:76,r:77,t:79,y:81,u:83,
-  // C5 sharps (Shift)
-  Q:73,W:75,        R:78,T:80,Y:82,
-  // C6
-  i:84,
+// ── Simple keyboard mapping ─────────────────────────────────────────────────
+const SIMPLE_KEY_ORDER = ['KeyA', 'KeyS', 'KeyD', 'KeyJ', 'KeyK', 'KeyL', 'Semicolon'];
+const SIMPLE_KEY_LAYOUT = {
+  KeyA:      { label: 'a', natural: 0, naturalName: 'C' },
+  KeyS:      { label: 's', natural: 2, naturalName: 'D' },
+  KeyD:      { label: 'd', natural: 4, naturalName: 'E' },
+  KeyJ:      { label: 'j', natural: 5, naturalName: 'F' },
+  KeyK:      { label: 'k', natural: 7, naturalName: 'G' },
+  KeyL:      { label: 'l', natural: 9, naturalName: 'A' },
+  Semicolon: { label: ';', natural: 11, naturalName: 'B' },
 };
-// Which white keys have a sharp (Shift version)
-const HAS_SHARP = new Set(['z','x','v','b','n','a','s','f','g','h','q','w','r','t','y']);
+const SHARPABLE_CODES = new Set(['KeyA', 'KeyS', 'KeyJ', 'KeyK', 'KeyL']);
 const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 function pitchName(midi) { return NOTE_NAMES[midi % 12] + (Math.floor(midi/12)-1); }
 
@@ -436,6 +429,10 @@ let state = {
   partInstruments:  {},  // partIndex → instrument name override
 };
 
+let _sheetMeasureEls = [];
+let _sheetHighlightRect = null;
+let _sheetHighlightIndex = -1;
+
 // ── API helpers ──────────────────────────────────────────────────────────────
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -471,14 +468,14 @@ function formatName(name) {
 
 // ── Play screen ───────────────────────────────────────────────────────────────
 async function fetchScore(name) {
-  const CACHE_KEY = `accompy_score_${name}`;
+  const CACHE_KEY = `accompy_score_v2_${name}`;
   try {
     // Cheap mtime check first
     const { mtime } = await api(`/api/scores/${name}/meta`);
     const cached = localStorage.getItem(CACHE_KEY);
     if (cached) {
       const parsed = JSON.parse(cached);
-      if (parsed._mtime === mtime) return parsed;
+      if (parsed._mtime === mtime && Array.isArray(parsed.measure_beats)) return parsed;
     }
     // Cache miss — fetch full data
     const data = await api(`/api/scores/${name}`);
@@ -509,12 +506,15 @@ async function openScore(name) {
   const frame = document.getElementById('sheet-frame');
   const placeholder = document.getElementById('sheet-placeholder');
   if (data.has_sheet) {
-    frame.src = `/api/scores/${name}/sheet`;
+    frame.onload = () => initializeSheetHighlighting();
+    frame.src = `/api/scores/${name}/sheet?v=${encodeURIComponent(data._mtime ?? Date.now())}`;
     frame.style.display = 'block';
     placeholder.style.display = 'none';
   } else {
+    frame.onload = null;
     frame.style.display = 'none';
     placeholder.style.display = 'block';
+    clearSheetHighlight();
   }
 
   // Part picker
@@ -592,55 +592,141 @@ function getLeftHand() {
   return left.map(n => [Array.isArray(n[0]) ? n[0] : [n[0]], n[1]]);
 }
 
+function initializeSheetHighlighting() {
+  const frame = document.getElementById('sheet-frame');
+  const doc = frame?.contentDocument;
+  if (!doc) return;
+
+  _sheetMeasureEls = [...doc.querySelectorAll('g.measure')];
+  _sheetHighlightRect = null;
+  _sheetHighlightIndex = -1;
+
+  const svg = doc.querySelector('svg.definition-scale');
+  if (!svg || !_sheetMeasureEls.length) return;
+
+  let style = doc.getElementById('accompy-measure-highlight-style');
+  if (!style) {
+    style = doc.createElement('style');
+    style.id = 'accompy-measure-highlight-style';
+    style.textContent = `
+      .accompy-measure-highlight {
+        fill: rgba(220, 40, 40, 0.12);
+        stroke: rgba(220, 40, 40, 0.95);
+        stroke-width: 24px;
+        rx: 20px;
+        ry: 20px;
+        pointer-events: none;
+      }
+    `;
+    doc.head?.appendChild(style);
+  }
+
+  updateSheetHighlight(0);
+}
+
+function clearSheetHighlight() {
+  _sheetMeasureEls = [];
+  _sheetHighlightRect?.remove();
+  _sheetHighlightRect = null;
+  _sheetHighlightIndex = -1;
+}
+
+function measureIndexForBeat(beat) {
+  const starts = state.current?.measure_beats || [];
+  if (!starts.length) return -1;
+
+  let idx = 0;
+  for (let i = 0; i < starts.length; i++) {
+    if (starts[i] <= beat + 0.001) idx = i;
+    else break;
+  }
+  return Math.min(idx, _sheetMeasureEls.length - 1);
+}
+
+function updateSheetHighlight(beat) {
+  if (!_sheetMeasureEls.length) return;
+  const idx = measureIndexForBeat(beat);
+  if (idx < 0 || idx === _sheetHighlightIndex) return;
+
+  const measureEl = _sheetMeasureEls[idx];
+  if (!measureEl) return;
+  const doc = measureEl.ownerDocument;
+
+  _sheetHighlightRect?.remove();
+  const bbox = measureEl.getBBox();
+  const rect = doc.createElementNS('http://www.w3.org/2000/svg', 'rect');
+  rect.setAttribute('class', 'accompy-measure-highlight');
+  rect.setAttribute('x', String(bbox.x - 36));
+  rect.setAttribute('y', String(bbox.y - 28));
+  rect.setAttribute('width', String(bbox.width + 72));
+  rect.setAttribute('height', String(bbox.height + 56));
+  measureEl.insertBefore(rect, measureEl.firstChild);
+
+  _sheetHighlightRect = rect;
+  _sheetHighlightIndex = idx;
+  measureEl.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+
 // ── Keyboard visualiser ───────────────────────────────────────────────────────
-const KB_ROWS = [
-  ['q','w','e','r','t','y','u','i'],
-  ['a','s','d','f','g','h','j'],
-  ['z','x','c','v','b','n','m'],
-];
+function expectedKeyboardPitch() {
+  const rightHand = getRightHand();
+  const position = state.tracker?.position ?? 0;
+  return rightHand[position]?.[0] ?? rightHand[0]?.[0] ?? 60;
+}
+
+function resolveTypedMidi(code, shifted = false) {
+  const layout = SIMPLE_KEY_LAYOUT[code];
+  if (!layout) return undefined;
+  const pitchClass = (layout.natural + (shifted && SHARPABLE_CODES.has(code) ? 1 : 0)) % 12;
+  const target = expectedKeyboardPitch();
+
+  let midi = pitchClass;
+  while (midi < target - 6) midi += 12;
+  while (midi > target + 6) midi -= 12;
+  while (midi < 24) midi += 12;
+  while (midi > 108) midi -= 12;
+  return midi;
+}
+
+function cueKeyIdForMidi(midi) {
+  const pitchClass = midi % 12;
+  for (const code of SIMPLE_KEY_ORDER) {
+    const layout = SIMPLE_KEY_LAYOUT[code];
+    if (layout.natural === pitchClass) return `kbkey-${code}`;
+    if (SHARPABLE_CODES.has(code) && (layout.natural + 1) % 12 === pitchClass) return `kbsharp-${code}`;
+  }
+  return null;
+}
 
 function buildKeyboard(rightHand) {
   const nextPitch = rightHand[0]?.[0];
 
-  KB_ROWS.forEach((row, ri) => {
-    const el = document.getElementById(`kb-row-${ri}`);
-    el.innerHTML = row.map(key => {
-      const midi     = KEY_MAP[key];
-      const name     = pitchName(midi);
-      const isNext   = midi === nextPitch;
-      const sharpKey = HAS_SHARP.has(key) ? key.toUpperCase() : null;
-      const sharpMidi = sharpKey ? KEY_MAP[sharpKey] : null;
-      const sharpName = sharpMidi ? pitchName(sharpMidi) : null;
-      const isNextSharp = sharpMidi === nextPitch;
+  const row = document.getElementById('kb-row-main');
+  row.innerHTML = SIMPLE_KEY_ORDER.map(code => {
+    const layout = SIMPLE_KEY_LAYOUT[code];
+    const sharpPitchClass = (layout.natural + 1) % 12;
+    const naturalIsNext = nextPitch % 12 === layout.natural;
+    const sharpIsNext = SHARPABLE_CODES.has(code) && nextPitch % 12 === sharpPitchClass;
 
-      const sharpBadge = sharpKey
-        ? `<div class="kb-sharp${isNextSharp ? ' next' : ''}" id="kbkey-${sharpKey}">
-             <span class="sharp-char">⇧${key}</span>
-             <span class="sharp-note">${sharpName}</span>
-           </div>`
-        : `<div class="kb-sharp-empty"></div>`;
+    const sharpBadge = SHARPABLE_CODES.has(code)
+      ? `<div class="kb-sharp${sharpIsNext ? ' next' : ''}" id="kbsharp-${code}">
+           <span class="sharp-char">⇧${layout.label}</span>
+           <span class="sharp-note">${NOTE_NAMES[sharpPitchClass]}</span>
+         </div>`
+      : `<div class="kb-sharp-empty"></div>`;
 
-      return `<div class="kb-key-wrap">
-        ${sharpBadge}
-        <div class="kb-key${isNext ? ' next' : ''}" id="kbkey-${key}">
-          <span class="key-char">${key}</span>
-          <span class="note-name">${name}</span>
-        </div>
-      </div>`;
-    }).join('');
-  });
-}
-
-// Build reverse map: midi → key (prefer lowercase/white keys)
-function buildPitchToKey() {
-  const map = {};
-  // Add sharps first so whites overwrite for natural notes
-  for (const [k, v] of Object.entries(KEY_MAP)) map[v] = k;
-  return map;
+    return `<div class="kb-key-wrap">
+      ${sharpBadge}
+      <div class="kb-key${naturalIsNext ? ' next' : ''}" id="kbkey-${code}">
+        <span class="key-char">${layout.label}</span>
+        <span class="note-name">${layout.naturalName}</span>
+      </div>
+    </div>`;
+  }).join('');
 }
 
 function highlightKey(key, on) {
-  const el = document.getElementById(`kbkey-${key}`);
+  const el = document.getElementById(key);
   if (el) el.classList.toggle('active', on);
 }
 
@@ -650,8 +736,8 @@ function updateNextKey(rightHand, position) {
   if (position >= rightHand.length) return;
 
   const midi = rightHand[position][0];
-  const key  = buildPitchToKey()[midi];
-  if (key) document.getElementById(`kbkey-${key}`)?.classList.add('next');
+  const keyId = cueKeyIdForMidi(midi);
+  if (keyId) document.getElementById(keyId)?.classList.add('next');
   document.getElementById('next-note-display').textContent = pitchName(midi);
 }
 
@@ -693,6 +779,7 @@ async function startPlaying() {
   document.getElementById('stop-btn').disabled  = false;
 
   updateNextKey(right, 0);
+  updateSheetHighlight(0);
   enableMidi();
   if (_inputMode === 'mic') _startMic();
 }
@@ -713,6 +800,7 @@ function handleNoteMic(midi) {
   if (beat !== null) {
     const bps = state.tracker.bps();
     state.accompanist.onRhNote(beat, bps);
+    updateSheetHighlight(beat);
     document.getElementById('beat-val').textContent  = beat.toFixed(1);
     document.getElementById('tempo-val').textContent = Math.round(bps * 60) + ' BPM';
     document.getElementById('progress-fill').style.width =
@@ -725,14 +813,15 @@ function handleNoteMic(midi) {
 function handleNote(midi) {
   if (!state.playing || !state.tracker) return;
   playNote(midi, 0.6, getInstrumentForPart(state.selectedPart ?? 0));
-  const k = buildPitchToKey()[midi];
-  highlightKey(k, true);
-  setTimeout(() => highlightKey(k, false), 120);
+  const keyId = cueKeyIdForMidi(midi);
+  highlightKey(keyId, true);
+  setTimeout(() => highlightKey(keyId, false), 120);
 
   const beat = state.tracker.onNote(midi);
   if (beat !== null) {
     const bps = state.tracker.bps();
     state.accompanist.onRhNote(beat, bps);
+    updateSheetHighlight(beat);
     document.getElementById('beat-val').textContent  = beat.toFixed(1);
     document.getElementById('tempo-val').textContent = Math.round(bps * 60) + ' BPM';
     document.getElementById('progress-fill').style.width =
@@ -901,7 +990,7 @@ function _stopMic() {
 document.addEventListener('keydown', e => {
   if (e.repeat) return;
   if (['INPUT','TEXTAREA'].includes(e.target.tagName)) return;
-  const midi = KEY_MAP[e.key];  // preserve case — uppercase = sharp
+  const midi = resolveTypedMidi(e.code, e.shiftKey);
   if (midi !== undefined) { e.preventDefault(); handleNote(midi); }
 });
 

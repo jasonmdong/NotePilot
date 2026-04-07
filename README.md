@@ -36,9 +36,8 @@ You'll be prompted for a starting BPM. The left hand plays between your notes an
 ### Keyboard layout
 
 ```
-Low  (C3–B3):  z x c v b n m
-Mid  (C4–B4):  a s d f g h j
-High (C5–B5):  q w e r t y u   i = C6
+A = C   S = D   D = E   J = F   K = G   L = A   ; = B
+Hold Shift for sharps. The app automatically chooses the octave for the current note.
 ```
 
 ## Adding pieces

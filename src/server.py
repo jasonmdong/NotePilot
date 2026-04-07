@@ -46,6 +46,7 @@ SCORES_DIR = "scores"
 # In-memory score cache: name → (mtime, module)
 # Invalidated automatically when the .py file changes on disk.
 _score_cache: dict[str, tuple[float, object]] = {}
+_measure_cache: dict[str, tuple[float, list[float]]] = {}
 
 
 def load_score_module(name: str):
@@ -63,6 +64,53 @@ def load_score_module(name: str):
     spec.loader.exec_module(mod)
     _score_cache[name] = (mtime, mod)
     return mod
+
+
+def load_measure_beats(name: str) -> list[float]:
+    path = os.path.join(SCORES_DIR, f"{name}.py")
+    if not os.path.exists(path):
+        return []
+
+    mtime = os.path.getmtime(path)
+    cached = _measure_cache.get(name)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
+    try:
+        with open(path, "r") as f:
+            first_line = f.readline().strip()
+    except OSError:
+        return []
+
+    prefixes = ("# Auto-generated: ", "# Auto-generated score: ")
+    source_ref = None
+    for prefix in prefixes:
+        if first_line.startswith(prefix):
+            source_ref = first_line[len(prefix):].strip()
+            break
+
+    if not source_ref:
+        return []
+
+    try:
+        from music21 import corpus as m21corpus, converter
+
+        if source_ref.startswith("corpus:"):
+            score = m21corpus.parse(source_ref[len("corpus:"):])
+        else:
+            try:
+                score = converter.parse(source_ref)
+            except Exception:
+                # Older generated scores may store a bare music21 corpus path.
+                score = m21corpus.parse(source_ref)
+
+        first_part = score.parts[0] if score.parts else score
+        measure_beats = [float(m.offset) for m in first_part.getElementsByClass('Measure')]
+    except Exception:
+        return []
+
+    _measure_cache[name] = (mtime, measure_beats)
+    return measure_beats
 
 
 @app.get("/api/corpus/search")
@@ -116,6 +164,7 @@ def get_score(name: str):
         "name":      name,
         "parts":     parts,
         "has_sheet": has_sheet,
+        "measure_beats": load_measure_beats(name),
         # keep legacy fields for CLI compatibility
         "right_hand": mod.RIGHT_HAND,
         "left_hand":  mod.LEFT_HAND,
@@ -159,6 +208,7 @@ def update_instrument(name: str, req: InstrumentUpdate):
         f.write("\n".join(new_lines) + "\n")
 
     _score_cache.pop(name, None)
+    _measure_cache.pop(name, None)
     return {"updated": True}
 
 
@@ -171,6 +221,7 @@ def delete_score(name: str):
             os.remove(path)
             removed.append(path)
     _score_cache.pop(name, None)
+    _measure_cache.pop(name, None)
     if not removed:
         raise HTTPException(status_code=404, detail=f"Score '{name}' not found")
     return {"deleted": removed}
@@ -247,6 +298,7 @@ def convert_score(req: ConvertRequest):
 
     # Bust the in-memory cache so the next GET picks up the new file
     _score_cache.pop(name, None)
+    _measure_cache.pop(name, None)
 
     # Write .html via verovio
     try:

@@ -137,7 +137,7 @@ header h1 span { color: #7c6af7; }
 .keyboard-section { background: #1a1a26; border-radius: 10px; padding: 1.25rem; margin-bottom: 1.5rem; }
 .keyboard-section h4 { font-size: .85rem; color: #aaa; margin-bottom: .75rem; }
 .kb-layout { display: flex; flex-direction: column; gap: .35rem; }
-.kb-row { display: flex; gap: .35rem; flex-wrap: wrap; }
+.kb-row { display: flex; gap: .35rem; flex-wrap: wrap; justify-content: center; }
 .kb-key-wrap {
   display: flex; flex-direction: column; align-items: center; gap: 3px;
 }
