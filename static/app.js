@@ -562,10 +562,13 @@ let _sheetHighlightRect = null;
 let _sheetHighlightIndex = -1;
 const SCORE_LIBRARY_KEY = 'accompy_score_library_v1';
 const SCORE_LIBRARY_INIT_KEY = 'accompy_score_library_initialized_v1';
+let _appConfig = { supabase_enabled: false, auth_enabled: false };
+let _authUser = null;
 
 // ── API helpers ──────────────────────────────────────────────────────────────
 async function api(path, opts) {
-  const request = { cache: 'no-store', ...(opts || {}) };
+  const headers = { ...((opts && opts.headers) || {}) };
+  const request = { cache: 'no-store', ...(opts || {}), headers };
   const r = await fetch(path, request);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
@@ -577,7 +580,113 @@ function showScreen(id) {
   document.getElementById(id).classList.add('active');
 }
 
+function setAuthStatus(message, tone = 'muted') {
+  const el = document.getElementById('auth-status');
+  if (!el) return;
+  el.textContent = message || '';
+  el.style.color = tone === 'error'
+    ? '#e05c5c'
+    : tone === 'success'
+      ? 'var(--success)'
+      : 'var(--muted)';
+}
+
+function updateAuthUI() {
+  const panel = document.getElementById('auth-panel');
+  const loggedOut = document.getElementById('auth-logged-out');
+  const loggedIn = document.getElementById('auth-logged-in');
+  const addPieceBtn = document.getElementById('add-piece-btn');
+  if (!panel || !loggedOut || !loggedIn || !addPieceBtn) return;
+  if (!_appConfig.auth_enabled) {
+    panel.style.display = 'none';
+    addPieceBtn.disabled = false;
+    return;
+  }
+
+  panel.style.display = 'block';
+  const isLoggedIn = !!_authUser;
+  loggedOut.style.display = isLoggedIn ? 'none' : 'block';
+  loggedIn.style.display = isLoggedIn ? 'block' : 'none';
+  addPieceBtn.disabled = !isLoggedIn;
+  if (isLoggedIn) {
+    document.getElementById('auth-user-email').textContent = _authUser.email || _authUser.username || 'Signed in';
+    setAuthStatus('');
+  } else {
+    document.getElementById('score-grid').innerHTML = '<div class="score-preview-empty">Sign in to load your score library.</div>';
+  }
+}
+
+async function initAppConfig() {
+  try {
+    _appConfig = await api('/api/config');
+    if (_appConfig.auth_enabled) {
+      const session = await api('/api/session');
+      _authUser = session.user || null;
+    }
+  } catch (error) {
+    _appConfig = { supabase_enabled: false, auth_enabled: false };
+    setAuthStatus(`Auth config failed to load: ${error.message || error}`);
+  }
+  updateAuthUI();
+}
+
+async function signIn() {
+  const username = document.getElementById('auth-email').value.trim();
+  const password = document.getElementById('auth-password').value;
+  if (!_appConfig.auth_enabled) return;
+  setAuthStatus('Signing in...');
+  try {
+    const result = await api('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    _authUser = result.user || null;
+    updateAuthUI();
+    await loadScoreList();
+    setAuthStatus('Signed in.', 'success');
+  } catch (error) {
+    setAuthStatus(error.message || 'Sign in failed.', 'error');
+    return;
+  }
+}
+
+async function signUp() {
+  if (!_appConfig.auth_enabled) return;
+  const username = document.getElementById('auth-email').value.trim();
+  const password = document.getElementById('auth-password').value;
+  setAuthStatus('Creating account...');
+  try {
+    const result = await api('/api/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    _authUser = result.user || null;
+    updateAuthUI();
+    await loadScoreList();
+    setAuthStatus('Account created.', 'success');
+  } catch (error) {
+    setAuthStatus(error.message || 'Sign up failed.', 'error');
+    return;
+  }
+}
+
+async function signOut() {
+  await api('/api/logout', { method: 'POST' });
+  _authUser = null;
+  state.current = null;
+  state.scores = [];
+  state.serverScores = [];
+  updateAuthUI();
+}
+
+window.signIn = signIn;
+window.signUp = signUp;
+window.signOut = signOut;
+
 function loadPersonalScoreLibrary() {
+  if (_appConfig.auth_enabled) return [...(state.serverScores || [])];
   try {
     const parsed = JSON.parse(localStorage.getItem(SCORE_LIBRARY_KEY) || '[]');
     return Array.isArray(parsed) ? parsed.filter((name) => typeof name === 'string' && name) : [];
@@ -587,6 +696,11 @@ function loadPersonalScoreLibrary() {
 }
 
 function savePersonalScoreLibrary(names) {
+  if (_appConfig.auth_enabled) {
+    const deduped = [...new Set((names || []).filter(Boolean))].sort();
+    state.scores = deduped;
+    return deduped;
+  }
   const deduped = [...new Set((names || []).filter(Boolean))].sort();
   localStorage.setItem(SCORE_LIBRARY_KEY, JSON.stringify(deduped));
   localStorage.setItem(SCORE_LIBRARY_INIT_KEY, '1');
@@ -729,18 +843,28 @@ function sanitizeSheetFrame(frame) {
 
 // ── Score list screen ─────────────────────────────────────────────────────────
 async function loadScoreList() {
+  if (_appConfig.auth_enabled && !_authUser) {
+    updateAuthUI();
+    return;
+  }
   applyScoreGridColumns(state.scoreGridColumns);
   const { scores = [], items = [] } = await api('/api/scores');
   state.serverScores = scores;
-  const existing = new Set(scores);
-  let library = loadPersonalScoreLibrary();
-  if (!localStorage.getItem(SCORE_LIBRARY_INIT_KEY)) library = scores;
-  library = savePersonalScoreLibrary(library.filter((name) => existing.has(name)));
   const grid = document.getElementById('score-grid');
   const itemByName = new Map((items.length ? items : scores.map(name => ({ name, has_sheet: false }))).map((item) => [item.name, item]));
-  const scoreItems = library
-    .map((name) => itemByName.get(name))
-    .filter(Boolean);
+  let scoreItems;
+  if (_appConfig.auth_enabled) {
+    state.scores = [...scores];
+    scoreItems = (items.length ? items : scores.map(name => ({ name, has_sheet: false })));
+  } else {
+    const existing = new Set(scores);
+    let library = loadPersonalScoreLibrary();
+    if (!localStorage.getItem(SCORE_LIBRARY_INIT_KEY)) library = scores;
+    library = savePersonalScoreLibrary(library.filter((name) => existing.has(name)));
+    scoreItems = library
+      .map((name) => itemByName.get(name))
+      .filter(Boolean);
+  }
   grid.innerHTML = scoreItems.map(({ name, has_sheet }) => `
     <div class="score-card" id="card-${name}" onclick="openScore('${name}')">
       <button class="delete-btn" onclick="deleteScore(event, '${name}')" title="Remove from my list">✕</button>
@@ -774,7 +898,10 @@ function formatName(name) {
 
 // ── Play screen ───────────────────────────────────────────────────────────────
 async function fetchScore(name) {
-  const CACHE_KEY = `accompy_score_v2_${name}`;
+  const scope = _appConfig.auth_enabled
+    ? (_authUser?.id || _authUser?.username || 'auth')
+    : 'local';
+  const CACHE_KEY = `accompy_score_v2_${scope}_${name}`;
   try {
     // Cheap mtime check first
     const { mtime } = await api(`/api/scores/${name}/meta`);
@@ -995,6 +1122,14 @@ function resolveTypedMidi(code, shifted = false) {
   const layout = SIMPLE_KEY_LAYOUT[code];
   if (!layout) return undefined;
   const pitchClass = (layout.natural + (shifted && SHARPABLE_CODES.has(code) ? 1 : 0)) % 12;
+  const rightHand = getRightHand();
+  const position = state.tracker?.position ?? 0;
+  const expectedEvent = rightHand[position] ?? rightHand[0];
+  const expectedPitches = eventPitches(expectedEvent);
+
+  const exactMatch = expectedPitches.find((pitch) => pitch % 12 === pitchClass);
+  if (exactMatch !== undefined) return exactMatch;
+
   const target = expectedKeyboardPitch();
 
   let midi = pitchClass;
@@ -1479,6 +1614,13 @@ function enableMidi() {
 // ── Delete piece ─────────────────────────────────────────────────────────────
 async function deleteScore(e, name) {
   e.stopPropagation();
+  if (_appConfig.auth_enabled) {
+    if (!confirm(`Delete "${formatName(name)}" from this account?`)) return;
+    await api(`/api/scores/${name}`, { method: 'DELETE' });
+    localStorage.removeItem(`accompy_score_v2_${_authUser?.id || _authUser?.username || 'auth'}_${name}`);
+    await loadScoreList();
+    return;
+  }
   if (!confirm(`Remove "${formatName(name)}" from this browser's list?`)) return;
   removeScoreFromLibrary(name);
   await loadScoreList();
@@ -1488,6 +1630,10 @@ async function deleteScore(e, name) {
 let _searchTimer = null;
 
 function openAddModal() {
+  if (_appConfig.auth_enabled && !_authUser) {
+    setAuthStatus('Sign in first to add pieces.', 'error');
+    return;
+  }
   document.getElementById('add-modal').style.display = 'flex';
   document.getElementById('corpus-search').value = '';
   document.getElementById('import-name').value = '';
@@ -1661,4 +1807,6 @@ initLatencyControls();
 initImportControls();
 onNoiseGateChange(document.getElementById('noise-gate')?.value || '1');
 setLatencyCompensation(localStorage.getItem('accompy_latency_comp_ms') || '0');
-loadScoreList();
+initAppConfig().then(() => {
+  if (!_appConfig.auth_enabled || _authUser) loadScoreList();
+});

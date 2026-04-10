@@ -16,11 +16,35 @@
 
 <!-- ── Score list ── -->
 <div id="list-screen" class="screen active">
+  <div id="auth-panel" class="auth-panel">
+    <div id="auth-logged-out" class="auth-card">
+      <h3>Sign in</h3>
+      <p class="auth-copy">Create an account or sign in to keep your own piece library.</p>
+      <div class="auth-form">
+        <input id="auth-email" type="text" placeholder="Username">
+        <input id="auth-password" type="password" placeholder="Password">
+        <div class="auth-actions">
+          <button class="btn btn-primary" type="button" onclick="signIn()">Log in</button>
+          <button class="btn btn-ghost" type="button" onclick="signUp()">Sign up</button>
+        </div>
+        <div id="auth-status" class="auth-status">Loading sign-in…</div>
+      </div>
+    </div>
+    <div id="auth-logged-in" class="auth-card" style="display:none">
+      <div class="auth-user-row">
+        <div>
+          <h3>Your Library</h3>
+          <p id="auth-user-email" class="auth-copy"></p>
+        </div>
+        <button class="btn btn-ghost" type="button" onclick="signOut()">Log out</button>
+      </div>
+    </div>
+  </div>
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:.25rem">
     <h2 style="font-size:1rem;color:#aaa">Choose a piece</h2>
-    <button class="btn btn-primary" onclick="openAddModal()">+ Add piece</button>
+    <button id="add-piece-btn" class="btn btn-primary" onclick="openAddModal()">+ Add piece</button>
   </div>
-  <p style="font-size:.85rem;color:#555;margin-bottom:.5rem">Play the right-hand melody — the left hand follows your tempo.</p>
+  <p style="font-size:.85rem;color:#555;margin-bottom:.5rem">Select a line to play, and the accompaniment will follow you.</p>
   <div class="score-grid-toolbar">
     <label for="score-grid-columns">Preview columns</label>
     <select id="score-grid-columns" class="instr-select" onchange="setScoreGridColumns(this.value)">

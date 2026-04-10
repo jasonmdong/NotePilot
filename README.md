@@ -188,3 +188,23 @@ python -m src.convert_score --show mozart_k545
 ```
 
 Free MusicXML sources: [IMSLP](https://imslp.org) · [Flat.io](https://flat.io)
+
+## Supabase Migration (in progress)
+
+To start moving score storage out of the local `scores/` folder and into Supabase:
+
+1. Copy `.env.example` to `.env`
+2. Fill in:
+   - `SUPABASE_URL`
+   - `SUPABASE_ANON_KEY`
+   - `SUPABASE_SERVICE_ROLE_KEY`
+3. Run [`supabase_simple_auth.sql`](supabase_simple_auth.sql) in the Supabase SQL editor.
+
+With those values present, the backend will:
+
+- list scores from Supabase
+- load scores from Supabase
+- save converted/imported scores into Supabase
+- store app-level users and sessions using simple username/password auth
+
+The local filesystem remains as a fallback when Supabase is not configured.

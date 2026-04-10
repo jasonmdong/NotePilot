@@ -15,14 +15,23 @@ import re
 import tempfile
 import subprocess
 import importlib.util
+import hashlib
+import hmac
+import secrets
 from pathlib import Path
 from functools import lru_cache
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from datetime import datetime, timedelta, timezone
+import requests
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from src.env import load_local_env
 from src.convert_score import convert_score_source, slugify_score_name
 from src.paths import get_scores_dir, get_static_dir
+from src.storage import create_score_store, LocalScoreStore, SupabaseScoreStore
+
+load_local_env()
 
 app = FastAPI()
 
@@ -55,6 +64,72 @@ ALLOWED_PDF_SUFFIXES = {".pdf"}
 # Invalidated automatically when the .py file changes on disk.
 _score_cache: dict[str, tuple[float, object]] = {}
 _measure_cache: dict[str, tuple[float, list[float]]] = {}
+_score_store = create_score_store()
+SESSION_COOKIE_NAME = "accompy_session"
+SESSION_DAYS = 30
+
+
+def hash_password(password: str, salt: str | None = None) -> str:
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 200_000)
+    return f"{salt}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt, digest = stored.split("$", 1)
+    except ValueError:
+        return False
+    calculated = hash_password(password, salt).split("$", 1)[1]
+    return hmac.compare_digest(calculated, digest)
+
+
+def create_session_token() -> str:
+    return secrets.token_urlsafe(48)
+
+
+def require_supabase_user_id(request: Request, action: str) -> str:
+    user_id = current_user_id_for_request(request)
+    if user_id:
+        return user_id
+    raise HTTPException(
+        status_code=401,
+        detail=f"Authenticated user is required for Supabase-backed {action}."
+    )
+
+
+def current_user_id_for_request(request: Request) -> str | None:
+    if isinstance(_score_store, SupabaseScoreStore):
+        token = request.cookies.get(SESSION_COOKIE_NAME, "").strip()
+        if token:
+            user = _score_store.get_app_session_user(token)
+            if user:
+                return user.get("id")
+    auth_header = request.headers.get("authorization", "").strip()
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+        if token and os.getenv("SUPABASE_URL", "").strip():
+            response = requests.get(
+                f"{os.getenv('SUPABASE_URL').rstrip('/')}/auth/v1/user",
+                headers={
+                    "apikey": os.getenv("SUPABASE_ANON_KEY", "").strip(),
+                    "Authorization": f"Bearer {token}",
+                },
+                timeout=15,
+            )
+            if response.status_code == 200:
+                return response.json().get("id")
+            raise HTTPException(status_code=401, detail="Invalid Supabase session.")
+    return None
+
+
+def current_app_user_for_request(request: Request) -> dict | None:
+    if not isinstance(_score_store, SupabaseScoreStore):
+        return None
+    token = request.cookies.get(SESSION_COOKIE_NAME, "").strip()
+    if not token:
+        return None
+    return _score_store.get_app_session_user(token)
 
 
 def load_score_module(name: str):
@@ -246,45 +321,112 @@ def search_corpus(q: str = ""):
     return {"results": results[:60]}
 
 
-@app.get("/api/scores")
-def list_scores():
-    names = sorted(f[:-3] for f in os.listdir(SCORES_DIR) if f.endswith(".py"))
+@app.get("/api/config")
+def get_config():
     return {
-        "scores": names,
-        "items": [
-            {
-                "name": name,
-                "has_sheet": os.path.exists(os.path.join(SCORES_DIR, f"{name}.html")),
-            }
-            for name in names
-        ],
+        "supabase_enabled": isinstance(_score_store, SupabaseScoreStore),
+        "auth_enabled": isinstance(_score_store, SupabaseScoreStore),
     }
+
+
+class SimpleAuthRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.get("/api/session")
+def get_session(request: Request):
+    user = current_app_user_for_request(request)
+    return {
+        "authenticated": bool(user),
+        "user": {
+            "id": user["id"],
+            "username": user["username"],
+        } if user else None,
+    }
+
+
+@app.post("/api/signup")
+def signup(req: SimpleAuthRequest, response: Response):
+    if not isinstance(_score_store, SupabaseScoreStore):
+        raise HTTPException(status_code=400, detail="Signup requires Supabase-backed storage.")
+    username = req.username.strip()
+    password = req.password
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,32}", username):
+        raise HTTPException(status_code=400, detail="Username must be 3-32 characters using letters, numbers, or underscore.")
+    if len(password) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters.")
+    existing = _score_store.get_app_user_by_username(username)
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already exists.")
+    created = _score_store.create_app_user(username, hash_password(password))
+    if not created:
+        raise HTTPException(status_code=500, detail="Could not create user.")
+    session_token = create_session_token()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
+    _score_store.create_app_session(created["id"], hashlib.sha256(session_token.encode("utf-8")).hexdigest(), expires_at.isoformat())
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_token,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        max_age=SESSION_DAYS * 24 * 60 * 60,
+        expires=SESSION_DAYS * 24 * 60 * 60,
+        path="/",
+    )
+    return {"ok": True, "user": {"id": created["id"], "username": created["username"]}}
+
+
+@app.post("/api/login")
+def login(req: SimpleAuthRequest, response: Response):
+    if not isinstance(_score_store, SupabaseScoreStore):
+        raise HTTPException(status_code=400, detail="Login requires Supabase-backed storage.")
+    username = req.username.strip()
+    password = req.password
+    user = _score_store.get_app_user_by_username(username)
+    if not user or not verify_password(password, user.get("password_hash") or ""):
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    session_token = create_session_token()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
+    _score_store.create_app_session(user["id"], hashlib.sha256(session_token.encode("utf-8")).hexdigest(), expires_at.isoformat())
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_token,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        max_age=SESSION_DAYS * 24 * 60 * 60,
+        expires=SESSION_DAYS * 24 * 60 * 60,
+        path="/",
+    )
+    return {"ok": True, "user": {"id": user["id"], "username": user["username"]}}
+
+
+@app.post("/api/logout")
+def logout(request: Request, response: Response):
+    if isinstance(_score_store, SupabaseScoreStore):
+        token = request.cookies.get(SESSION_COOKIE_NAME, "").strip()
+        if token:
+            _score_store.delete_app_session(token)
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/scores")
+def list_scores(request: Request):
+    if isinstance(_score_store, SupabaseScoreStore):
+        user_id = require_supabase_user_id(request, "score listing")
+        return _score_store.list_scores(user_id)
+    return _score_store.list_scores()
 
 
 @app.get("/api/scores/{name}")
-def get_score(name: str):
-    mod = load_score_module(name)
-    has_sheet = os.path.exists(os.path.join(SCORES_DIR, f"{name}.html"))
-
-    # New format: PARTS list
-    if hasattr(mod, "PARTS"):
-        parts = mod.PARTS
-    else:
-        # Legacy format (e.g. twinkle.py) — wrap in a single part
-        parts = [
-            {"name": "Melody",        "notes": [[p, b] for p, b in mod.RIGHT_HAND]},
-            {"name": "Accompaniment", "notes": [[p, b] for p, b in mod.LEFT_HAND]},
-        ]
-
-    return {
-        "name":      name,
-        "parts":     parts,
-        "has_sheet": has_sheet,
-        "measure_beats": load_measure_beats(name),
-        # keep legacy fields for CLI compatibility
-        "right_hand": mod.RIGHT_HAND,
-        "left_hand":  mod.LEFT_HAND,
-    }
+def get_score(name: str, request: Request):
+    if isinstance(_score_store, SupabaseScoreStore):
+        user_id = require_supabase_user_id(request, "score loading")
+        return _score_store.load_score(user_id, name)
+    return _score_store.load_score(name)
 
 
 class InstrumentUpdate(BaseModel):
@@ -293,8 +435,25 @@ class InstrumentUpdate(BaseModel):
 
 
 @app.patch("/api/scores/{name}/instrument")
-def update_instrument(name: str, req: InstrumentUpdate):
+def update_instrument(name: str, req: InstrumentUpdate, request: Request):
     """Persist an instrument change for a part in the score .py file."""
+    if isinstance(_score_store, SupabaseScoreStore):
+        user_id = require_supabase_user_id(request, "score updates")
+        score = _score_store.load_score(user_id, name)
+        parts = score["parts"]
+        if req.part_index < 0 or req.part_index >= len(parts):
+            raise HTTPException(status_code=400, detail="Invalid part index")
+        parts[req.part_index]["instrument"] = req.instrument
+        _score_store.save_score(user_id, {
+            "name": score["name"],
+            "title": score.get("title") or score["name"],
+            "parts": parts,
+            "measure_beats": score.get("measure_beats") or [],
+            "sheet_html": score.get("sheet_html") or "",
+            "source_type": "converted",
+        })
+        return {"updated": True}
+
     mod  = load_score_module(name)
     path = os.path.join(SCORES_DIR, f"{name}.py")
 
@@ -329,7 +488,13 @@ def update_instrument(name: str, req: InstrumentUpdate):
 
 
 @app.delete("/api/scores/{name}")
-def delete_score(name: str):
+def delete_score(name: str, request: Request):
+    if isinstance(_score_store, SupabaseScoreStore):
+        user_id = current_user_id_for_request(request)
+        if not user_id:
+            raise HTTPException(status_code=500, detail="Authenticated user is required for Supabase-backed deletes.")
+        _score_store.delete_score(user_id, name)
+        return {"deleted": [name]}
     removed = []
     for ext in (".py", ".html"):
         path = os.path.join(SCORES_DIR, f"{name}{ext}")
@@ -344,7 +509,9 @@ def delete_score(name: str):
 
 
 @app.get("/api/scores/{name}/meta")
-def get_score_meta(name: str):
+def get_score_meta(name: str, request: Request):
+    if isinstance(_score_store, SupabaseScoreStore):
+        return {"name": name, "mtime": 0}
     path = os.path.join(SCORES_DIR, f"{name}.py")
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail=f"Score '{name}' not found")
@@ -352,7 +519,14 @@ def get_score_meta(name: str):
 
 
 @app.get("/api/scores/{name}/sheet")
-def get_sheet(name: str):
+def get_sheet(name: str, request: Request):
+    if isinstance(_score_store, SupabaseScoreStore):
+        user_id = require_supabase_user_id(request, "sheet loading")
+        html = _score_store.load_score(user_id, name).get("sheet_html") or ""
+        if not html:
+            raise HTTPException(status_code=404, detail="No sheet music for this score")
+        html = re.sub(r"\s*<h1>.*?</h1>\s*", "\n", html, count=1, flags=re.IGNORECASE | re.DOTALL)
+        return HTMLResponse(content=html)
     path = os.path.join(SCORES_DIR, f"{name}.html")
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="No sheet music for this score")
@@ -375,11 +549,37 @@ class ConvertRequest(BaseModel):
 
 
 @app.post("/api/convert")
-def convert_score(req: ConvertRequest):
+def convert_score(req: ConvertRequest, request: Request):
+    out_dir = SCORES_DIR
+    temp_dir = None
+    if isinstance(_score_store, SupabaseScoreStore):
+        temp_dir = tempfile.TemporaryDirectory(prefix="accompy_convert_")
+        out_dir = temp_dir.name
     try:
-        result = convert_score_source(f"corpus:{req.corpus_path}", name=score_name_from_input(req.name), out_dir=SCORES_DIR)
+        result = convert_score_source(f"corpus:{req.corpus_path}", name=score_name_from_input(req.name), out_dir=out_dir)
     except Exception as exc:
+        if temp_dir:
+            temp_dir.cleanup()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if isinstance(_score_store, SupabaseScoreStore):
+        user_id = require_supabase_user_id(request, "score saving")
+        saved = _score_store.save_score(user_id, {
+            "name": result["name"],
+            "title": result["title"],
+            "parts": result["parts"],
+            "measure_beats": result["measure_beats"],
+            "sheet_html": Path(result["out_html"]).read_text(encoding="utf-8") if os.path.exists(result["out_html"]) else "",
+            "source_type": "corpus",
+        })
+        if temp_dir:
+            temp_dir.cleanup()
+        return {
+            "name": saved["name"],
+            "parts": len(saved["parts"]),
+            "total_notes": sum(len(part.get("notes", [])) for part in saved["parts"]),
+            "has_sheet": saved["has_sheet"],
+    }
 
     invalidate_score_cache(result["name"])
     return {
@@ -392,6 +592,7 @@ def convert_score(req: ConvertRequest):
 
 @app.post("/api/import")
 async def import_score(
+    request: Request,
     files: list[UploadFile] = File(...),
     name: str = Form(""),
 ):
@@ -413,9 +614,27 @@ async def import_score(
         musicxml_path = find_musicxml_output(output_dir)
 
         try:
-            result = convert_score_source(str(musicxml_path), name=score_name, out_dir=SCORES_DIR)
+            out_dir = output_dir if isinstance(_score_store, SupabaseScoreStore) else SCORES_DIR
+            result = convert_score_source(str(musicxml_path), name=score_name, out_dir=str(out_dir))
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Could not convert Audiveris output: {exc}") from exc
+
+    if isinstance(_score_store, SupabaseScoreStore):
+        user_id = require_supabase_user_id(request, "score saving")
+        saved = _score_store.save_score(user_id, {
+            "name": result["name"],
+            "title": result["title"],
+            "parts": result["parts"],
+            "measure_beats": result["measure_beats"],
+            "sheet_html": Path(result["out_html"]).read_text(encoding="utf-8") if os.path.exists(result["out_html"]) else "",
+            "source_type": "upload",
+        })
+        return {
+            "name": saved["name"],
+            "parts": len(saved["parts"]),
+            "total_notes": sum(len(part.get("notes", [])) for part in saved["parts"]),
+            "has_sheet": saved["has_sheet"],
+        }
 
     invalidate_score_cache(result["name"])
     return {

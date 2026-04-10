@@ -59,6 +59,63 @@ header h1 span { color: var(--accent); }
   cursor: pointer;
 }
 
+.auth-panel {
+  margin-bottom: 1.25rem;
+}
+
+.auth-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem 1.1rem;
+}
+
+.auth-card h3 {
+  font-size: 1rem;
+  margin-bottom: .3rem;
+}
+
+.auth-copy {
+  font-size: .82rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: .75rem;
+  margin-top: .8rem;
+}
+
+.auth-form input {
+  width: 100%;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  border-radius: 8px;
+  padding: .7rem .8rem;
+  font-size: .9rem;
+}
+
+.auth-actions {
+  display: flex;
+  gap: .65rem;
+}
+
+.auth-status {
+  min-height: 1.1rem;
+  font-size: .8rem;
+  color: var(--muted);
+}
+
+.auth-user-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
 .modal-section h4 {
   font-size: .88rem;
   color: var(--text);
