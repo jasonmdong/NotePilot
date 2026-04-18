@@ -116,10 +116,12 @@ def convert_score_source(source: str, *, name: str | None = None, out_dir: str |
         mxl_path = str(m21corpus.getWork(corpus_path))
         score = m21corpus.parse(corpus_path)
         title_fallback = source
+        render_source_path = mxl_path
     else:
         mxl_path = source
         score = converter.parse(source)
         title_fallback = source
+        render_source_path = mxl_path
 
     parts_data = build_parts_data(score)
     measure_beats = extract_measure_beats(score)
@@ -129,8 +131,18 @@ def convert_score_source(source: str, *, name: str | None = None, out_dir: str |
     out_py = os.path.join(out_dir, f"{score_name}.py")
     out_html = os.path.join(out_dir, f"{score_name}.html")
 
+    # Normalize uploaded MusicXML through music21 before sending it to Verovio.
+    # Some raw .xml inputs parse fine in music21 but render poorly or blank in
+    # Verovio until they are re-exported into canonical MusicXML.
+    if not source.startswith("corpus:"):
+        normalized_musicxml = os.path.join(out_dir, f"{score_name}__normalized.musicxml")
+        try:
+            render_source_path = score.write("musicxml", fp=normalized_musicxml)
+        except Exception:
+            render_source_path = mxl_path
+
     write_score_py(parts_data, out_py, title, source_ref=source, measure_beats=measure_beats)
-    render_html(mxl_path, out_html, title)
+    render_html(str(render_source_path), out_html, title)
 
     total_notes = sum(len(p["notes"]) for p in parts_data)
     return {
@@ -144,6 +156,7 @@ def convert_score_source(source: str, *, name: str | None = None, out_dir: str |
         "has_sheet": os.path.exists(out_html),
         "source_ref": source,
         "measure_beats": measure_beats,
+        "render_source_path": str(render_source_path),
     }
 
 
@@ -236,10 +249,16 @@ def render_html(mxl_path: str, out_path: str, title: str):
     tk.loadFile(mxl_path)
 
     page_count = tk.getPageCount()
+    if page_count <= 0:
+        return
+
     svgs = [tk.renderToSVG(i + 1) for i in range(page_count)]
+    non_empty_svgs = [svg for svg in svgs if svg and "<svg" in svg and len(svg) > 500]
+    if not non_empty_svgs:
+        return
 
     page_divs = "\n".join(
-        f'<div class="page">{svg}</div>' for svg in svgs
+        f'<div class="page">{svg}</div>' for svg in non_empty_svgs
     )
 
     html = f"""<!DOCTYPE html>

@@ -9,6 +9,7 @@ from fastapi import HTTPException
 def _score_row_to_payload(row: dict) -> dict:
     score_data = row.get("score_data") or {}
     parts = score_data.get("parts") or []
+    musicxml_source = score_data.get("musicxml_source") or ""
     right_hand = parts[0]["notes"] if parts else []
     left_hand = []
     for part in parts[1:]:
@@ -16,15 +17,18 @@ def _score_row_to_payload(row: dict) -> dict:
             pitches = event[0] if isinstance(event[0], list) else [event[0]]
             left_hand.append([pitches, event[1]])
     left_hand.sort(key=lambda event: event[1])
+    sheet_html = row.get("sheet_html") or ""
+    has_sheet = "<svg" in sheet_html
     return {
         "name": row.get("slug") or row.get("id"),
         "title": row.get("title") or row.get("slug") or row.get("id"),
         "parts": parts,
-        "has_sheet": bool(row.get("sheet_html")),
+        "has_sheet": has_sheet,
         "measure_beats": row.get("measure_beats") or [],
         "right_hand": right_hand,
         "left_hand": left_hand,
-        "sheet_html": row.get("sheet_html") or "",
+        "sheet_html": sheet_html if has_sheet else "",
+        "musicxml_source": musicxml_source,
     }
 
 
@@ -69,7 +73,7 @@ class SupabaseScoreStore:
             "items": [
                 {
                     "name": row["slug"],
-                    "has_sheet": bool(row.get("sheet_html")),
+                    "has_sheet": "<svg" in (row.get("sheet_html") or ""),
                 }
                 for row in rows if row.get("slug")
             ],
@@ -98,6 +102,7 @@ class SupabaseScoreStore:
             "source_type": payload.get("source_type") or "converted",
             "score_data": {
                 "parts": payload["parts"],
+                "musicxml_source": payload.get("musicxml_source") or "",
             },
             "measure_beats": payload.get("measure_beats") or [],
             "sheet_html": payload.get("sheet_html") or "",

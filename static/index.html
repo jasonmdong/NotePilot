@@ -81,12 +81,12 @@
       <div class="upload-divider"></div>
 
       <div class="modal-section">
-        <h4>Import PDF or images</h4>
-        <p class="modal-copy">Upload one PDF or a set of page screenshots. Audiveris will convert them to MusicXML, then accompy will build the playable score.</p>
+        <h4>Import PDF, images, or MusicXML</h4>
+        <p class="modal-copy">Upload one PDF, a set of page screenshots, or a MusicXML file. PDF/images go through Audiveris first; MusicXML imports directly.</p>
       </div>
       <div class="upload-form">
         <input id="import-name" type="text" placeholder="Piece name (optional)">
-        <input id="import-files" type="file" accept=".pdf,.png,.jpg,.jpeg,image/png,image/jpeg,application/pdf" multiple>
+        <input id="import-files" type="file" accept=".pdf,.png,.jpg,.jpeg,.xml,.mxl,.musicxml,image/png,image/jpeg,application/pdf,text/xml,application/xml" multiple>
         <div class="upload-actions">
           <button id="import-btn" type="button" class="btn btn-primary" onclick="importScoreFiles()">Import</button>
           <span id="import-status" class="import-status">No files selected.</span>
@@ -153,6 +153,7 @@
       No sheet music available for this score.<br>
       Re-run <code>convert_score.py</code> with verovio installed to generate it.
     </div>
+    <div id="sheet-musicxml-fallback" class="sheet-musicxml-fallback" style="display:none"></div>
   </div>
 
   <div class="play-bottom">
@@ -231,6 +232,7 @@
 </div>
 
 <script src="https://unpkg.com/tone@15.1.22/build/Tone.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.9.2/build/opensheetmusicdisplay.min.js"></script>
 <script src="pitch.js"></script>
 <script src="app.js"></script>
 </body>

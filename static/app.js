@@ -896,6 +896,31 @@ function formatName(name) {
   return name.replace(/_/g,' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
+let _musicXmlDisplay = null;
+
+async function renderMusicXmlFallback(xmlText) {
+  const host = document.getElementById('sheet-musicxml-fallback');
+  if (!host || !window.opensheetmusicdisplay?.OpenSheetMusicDisplay) return false;
+  host.innerHTML = '';
+  host.style.display = 'block';
+  try {
+    _musicXmlDisplay = new window.opensheetmusicdisplay.OpenSheetMusicDisplay(host, {
+      autoResize: true,
+      drawTitle: false,
+      drawPartNames: true,
+      backend: 'svg',
+    });
+    await _musicXmlDisplay.load(xmlText);
+    _musicXmlDisplay.render();
+    return true;
+  } catch (error) {
+    console.warn('MusicXML fallback render failed:', error);
+    host.innerHTML = '';
+    host.style.display = 'none';
+    return false;
+  }
+}
+
 // ── Play screen ───────────────────────────────────────────────────────────────
 async function fetchScore(name) {
   const scope = _appConfig.auth_enabled
@@ -938,6 +963,9 @@ async function openScore(name) {
   // Sheet music
   const frame = document.getElementById('sheet-frame');
   const placeholder = document.getElementById('sheet-placeholder');
+  const musicXmlFallback = document.getElementById('sheet-musicxml-fallback');
+  musicXmlFallback.style.display = 'none';
+  musicXmlFallback.innerHTML = '';
   if (data.has_sheet) {
     frame.onload = () => {
       sanitizeSheetFrame(frame);
@@ -949,7 +977,13 @@ async function openScore(name) {
   } else {
     frame.onload = null;
     frame.style.display = 'none';
-    placeholder.style.display = 'block';
+    const renderedFallback = data.musicxml_source
+      ? await renderMusicXmlFallback(data.musicxml_source)
+      : false;
+    placeholder.style.display = renderedFallback ? 'none' : 'block';
+    placeholder.textContent = renderedFallback
+      ? ''
+      : 'Sheet preview unavailable for this score.';
     clearSheetHighlight();
   }
 
@@ -1750,7 +1784,7 @@ async function importScoreFiles() {
   const files = [...(fileInput?.files || [])];
 
   if (!files.length) {
-    setImportStatus('Choose a PDF or one/more page images first.', 'error');
+    setImportStatus('Choose a MusicXML file, one PDF, or one/more page images first.', 'error');
     return;
   }
 
@@ -1759,7 +1793,8 @@ async function importScoreFiles() {
   form.append('name', (nameInput?.value || '').trim());
 
   button.disabled = true;
-  setImportStatus('Running Audiveris and converting the score…');
+  const isDirectMusicXml = files.length === 1 && /\.(xml|mxl|musicxml)$/i.test(files[0].name || '');
+  setImportStatus(isDirectMusicXml ? 'Importing MusicXML and building the score…' : 'Running Audiveris and converting the score…');
 
   try {
     const response = await fetch('/api/import', { method: 'POST', body: form });
