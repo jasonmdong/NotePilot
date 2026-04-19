@@ -20,7 +20,7 @@ class Accompanist:
     def __init__(self, left_hand: list, right_hand: list, initial_bps: float = 2.0):
         self._events      = sorted(left_hand,  key=lambda x: x[1])
         # Sorted unique beat positions of every right-hand note (sync points).
-        self._rh_beats    = sorted({beat for _, beat in right_hand})
+        self._rh_beats    = sorted({event[1] for event in right_hand})
 
         self._bps         = initial_bps
         self._sync_beat   = 0.0
@@ -87,7 +87,7 @@ class Accompanist:
             with self._lock:
                 if self._lh_idx >= len(self._events):
                     break
-                pitches, beat = self._events[self._lh_idx]
+                pitches, beat = self._events[self._lh_idx][:2]
                 next_sync     = self._next_sync
 
             # ── Pause before the next RH sync point ──

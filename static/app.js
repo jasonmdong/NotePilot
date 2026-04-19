@@ -34,12 +34,14 @@ const INSTRUMENT_EMOJI = {
 };
 const TEMPO_PAUSE_IGNORE_SEC = 3;
 let _accompanimentLatencyCompSec = 0.28;
+const CHORD_MATCH_WINDOW_SEC = 0.5;
 
 // ── Playback engines ────────────────────────────────────────────────────────
 let _audioCtx = null;
 let _midiConnected = false;
 let _lastMidiNoteTime = 0;
 let _lastMidiPitch = null;
+let _pedalResonanceBus = null;
 function audioCtx() {
   if (!_audioCtx) _audioCtx = new AudioContext({ latencyHint: 'interactive' });
   return _audioCtx;
@@ -226,6 +228,123 @@ function noteDurationSeconds(instrument, baseSeconds) {
   return Math.max(0.18, Math.min(1.25, baseSeconds * tempoScale * familyBoost * aliasBoost));
 }
 
+function eventDuration(event, fallbackBeats = 0.75) {
+  const raw = Number(event?.[2]);
+  return Number.isFinite(raw) && raw > 0 ? raw : fallbackBeats;
+}
+
+function eventPedalRelease(event) {
+  const raw = Number(event?.[3]);
+  return Number.isFinite(raw) && raw > 0 ? raw : null;
+}
+
+function isPedaledEvent(event) {
+  return eventPedalRelease(event) !== null;
+}
+
+function eventPedalHoldSeconds(event, bps = currentBps()) {
+  const releaseBeat = eventPedalRelease(event);
+  const beat = Number(event?.[1]);
+  if (releaseBeat === null || !Number.isFinite(beat)) return null;
+  return Math.max(0.12, (releaseBeat - beat) / Math.max(0.5, bps));
+}
+
+function eventDurationSeconds(event, instrument = 'piano', fallbackBeats = 0.75) {
+  const beats = eventDuration(event, fallbackBeats);
+  const seconds = beats / Math.max(0.5, currentBps());
+  const familyBoost = ['violin', 'viola', 'cello', 'strings'].includes(instrument) ? 1.08 : 1.0;
+  const pianoBoost = instrument === 'piano' ? 1.22 : 1.0;
+  return Math.max(0.14, Math.min(10, seconds * familyBoost * pianoBoost));
+}
+
+function ensurePedalResonanceBus() {
+  if (_pedalResonanceBus) return _pedalResonanceBus;
+  const ctx = audioCtx();
+  const convolver = ctx.createConvolver();
+  const impulseSeconds = 2.4;
+  const length = Math.floor(ctx.sampleRate * impulseSeconds);
+  const impulse = ctx.createBuffer(2, length, ctx.sampleRate);
+  for (let channel = 0; channel < impulse.numberOfChannels; channel++) {
+    const data = impulse.getChannelData(channel);
+    for (let i = 0; i < length; i++) {
+      const t = i / length;
+      const decay = Math.pow(1 - t, 2.2);
+      data[i] = (Math.random() * 2 - 1) * decay * 0.22;
+    }
+  }
+  convolver.buffer = impulse;
+
+  const pre = ctx.createGain();
+  pre.gain.value = 0.55;
+  const lowpass = ctx.createBiquadFilter();
+  lowpass.type = 'lowpass';
+  lowpass.frequency.value = 2800;
+  const highpass = ctx.createBiquadFilter();
+  highpass.type = 'highpass';
+  highpass.frequency.value = 110;
+  const wet = ctx.createGain();
+  wet.gain.value = 0.05;
+
+  pre.connect(convolver);
+  convolver.connect(lowpass);
+  lowpass.connect(highpass);
+  highpass.connect(wet);
+  wet.connect(ctx.destination);
+
+  _pedalResonanceBus = { pre, wet };
+  return _pedalResonanceBus;
+}
+
+function playPedalResonance(pitches, velocity = 0.5, opts = {}) {
+  if (!pitches?.length) return;
+  const ctx = audioCtx();
+  const now = ctx.currentTime;
+  const { pre, wet } = ensurePedalResonanceBus();
+  const duration = Math.max(0.7, Math.min(12, (opts.duration ?? 1.5) * 1.9 + 0.45));
+  const pedalHold = Math.max(duration, opts.pedalHold ?? duration);
+  const resonanceGain = Math.min(0.16, 0.08 + velocity * 0.06) / Math.sqrt(pitches.length);
+  const harmonicShape = [
+    [1, 1.0],
+    [2, 0.65],
+    [3, 0.38],
+    [4, 0.22],
+    [5, 0.12],
+  ];
+
+  wet.gain.cancelScheduledValues(now);
+  wet.gain.setValueAtTime(Math.max(0.05, wet.gain.value), now);
+  wet.gain.linearRampToValueAtTime(Math.max(0.18, 0.12 + velocity * 0.12), now + 0.08);
+  wet.gain.setValueAtTime(Math.max(0.18, 0.12 + velocity * 0.12), now + pedalHold);
+  wet.gain.exponentialRampToValueAtTime(0.05, now + pedalHold + 0.45);
+
+  pitches.forEach((midi) => {
+    const fundamental = 440 * Math.pow(2, (midi - 69) / 12);
+    harmonicShape.forEach(([mult, amp], idx) => {
+      const osc = ctx.createOscillator();
+      const body = ctx.createBiquadFilter();
+      body.type = 'bandpass';
+      body.frequency.value = Math.min(5200, fundamental * mult);
+      body.Q.value = idx === 0 ? 8 : 10 + idx * 2;
+      const gain = ctx.createGain();
+      const start = now + idx * 0.004;
+      const peak = resonanceGain * amp;
+
+      osc.type = idx === 0 ? 'triangle' : 'sine';
+      osc.frequency.value = fundamental * mult;
+
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), start + 0.05);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+
+      osc.connect(body);
+      body.connect(gain);
+      gain.connect(pre);
+      osc.start(start);
+      osc.stop(start + duration + 0.03);
+    });
+  });
+}
+
 async function ensureSamplePlayback(instruments = []) {
   const requested = [...new Set(instruments
     .map(ins => SAMPLE_ALIAS[ins] || ins)
@@ -294,13 +413,13 @@ async function preloadCurrentScoreInstruments() {
   }
 }
 
-function playSynthNote(midi, velocity = 0.6, instrument = 'piano') {
+function playSynthNote(midi, velocity = 0.6, instrument = 'piano', opts = {}) {
   const ctx    = audioCtx();
   const freq   = 440 * Math.pow(2, (midi - 69) / 12);
   const preset = INSTRUMENT_PRESETS[instrument] || INSTRUMENT_PRESETS.piano;
   const now    = ctx.currentTime;
   const baseDur = instrument === 'piano' ? 0.55 : 0.5;
-  const dur    = noteDurationSeconds(instrument, baseDur);
+  const dur    = Math.max(0.12, opts.duration ?? noteDurationSeconds(instrument, baseDur));
 
   const masterGain = ctx.createGain();
   masterGain.connect(ctx.destination);
@@ -349,16 +468,22 @@ function playNote(midi, velocity = 0.6, instrument = 'piano', opts = {}) {
   const sampler = _sampleSamplers[sampledInstrument];
   if (sampler && !opts.preferSynth) {
     const baseDuration = SAMPLE_LIBRARY[sampledInstrument]?.noteDuration ?? 0.45;
-    const duration = noteDurationSeconds(instrument, baseDuration);
+    const duration = Math.max(0.12, opts.duration ?? noteDurationSeconds(instrument, baseDuration));
     sampler.triggerAttackRelease(midiToToneNote(midi), duration, undefined, Math.min(1, velocity));
+    if (instrument === 'piano' && opts.pedaled) {
+      playPedalResonance([midi], velocity, opts);
+    }
     return;
   }
   if (isSampleBackedInstrument(instrument)) return;
-  playSynthNote(midi, velocity, instrument);
+  playSynthNote(midi, velocity, instrument, opts);
 }
 
 function playChord(pitches, velocity = 0.5, instrument = 'piano', opts = {}) {
   pitches.forEach(p => playNote(p, velocity / pitches.length + 0.3, instrument, opts));
+  if (instrument === 'piano' && opts.pedaled) {
+    playPedalResonance(pitches, velocity, opts);
+  }
 }
 
 function eventPitches(event) {
@@ -398,20 +523,28 @@ class Tracker {
     this._pendingChord = new Set();
     this._pendingPosition = -1;
     this._pendingStartedAt = 0;
+    this._recentNotes = [];
   }
 
   onNote(pitch) {
     const expected = this.score[this.position];
     if (!expected) return null;
+    const now = performance.now() / 1000;
+    this._recentNotes.push({ pitch, time: now });
+    this._recentNotes = this._recentNotes.filter((entry) => now - entry.time <= CHORD_MATCH_WINDOW_SEC);
+
     const pitches = eventPitches(expected);
     if (pitches.length === 1) {
       return pitches[0] === pitch ? this._advance(this.position) : null;
     }
 
     if (!pitches.includes(pitch)) return null;
-    const now = performance.now() / 1000;
-    if (this._pendingPosition !== this.position || now - this._pendingStartedAt > 0.4) {
-      this._pendingChord.clear();
+    if (this._pendingPosition !== this.position || now - this._pendingStartedAt > CHORD_MATCH_WINDOW_SEC) {
+      this._pendingChord = new Set(
+        this._recentNotes
+          .filter((entry) => pitches.includes(entry.pitch))
+          .map((entry) => entry.pitch)
+      );
       this._pendingPosition = this.position;
       this._pendingStartedAt = now;
     }
@@ -479,7 +612,7 @@ class Accompanist {
     // leftInstruments: array of instrument names parallel to the non-selected parts
     // Each event gets the instrument of the source part it came from.
     // Since getLeftHand() merges parts in order, we track that here.
-    this.events    = [...leftHand].sort((a,b) => a[1]-b[1]); // [[pitches,beat],...]
+    this.events    = [...leftHand].sort((a,b) => a[1]-b[1]); // [[pitches,beat,duration],...]
     this._instruments = leftInstruments;
     this.rhBeats   = [...new Set(rightHand.map(n=>n[1]))].sort((a,b)=>a-b);
     this._bps      = initialBps;
@@ -522,14 +655,20 @@ class Accompanist {
     if (!this._running) return;
 
     if (this._syncTime !== null && this._lhIdx < this.events.length) {
-      const [pitches, beat] = this.events[this._lhIdx];
+      const [pitches, beat, durationBeats] = this.events[this._lhIdx];
 
       // Pause before next RH sync point
       if (beat < this._nextSync - 0.01) {
         const current = this._currentBeat();
         if (current >= beat - 0.005) {
           const instr = this._instruments[0] || 'piano';
-          playChord(pitches, 0.5, instr);
+          const duration = Math.max(0.12, (durationBeats ?? 0.75) / Math.max(0.5, this._bps));
+          const pedalRelease = eventPedalRelease(this.events[this._lhIdx]);
+          playChord(pitches, 0.5, instr, {
+            duration,
+            pedaled: pedalRelease !== null,
+            pedalHold: pedalRelease !== null ? Math.max(duration, (pedalRelease - beat) / Math.max(0.5, this._bps)) : null,
+          });
           this._lhIdx++;
         }
       }
@@ -1065,7 +1204,12 @@ function getLeftHand() {
   const left = [];
   parts.forEach((p, i) => { if (i !== idx) left.push(...p.notes); });
   left.sort((a, b) => a[1] - b[1]);
-  return left.map((event) => [eventPitches(event), event[1]]);
+  return left.map((event) => {
+    const merged = [eventPitches(event), event[1], eventDuration(event)];
+    const pedalRelease = eventPedalRelease(event);
+    if (pedalRelease !== null) merged.push(pedalRelease);
+    return merged;
+  });
 }
 
 function initializeSheetHighlighting() {
@@ -1242,9 +1386,8 @@ function renderNoteHighway() {
 
     const t = (delta + lookBehind) / (lookAhead + lookBehind);
     const top = Math.max(topPadding, (1 - t) * (hitLineTop - topPadding) + topPadding);
-    const nextBeat = rightHand[i + 1]?.[1] ?? (beat + 0.75);
-    const sustainBeats = Math.max(0.25, nextBeat - beat);
-    const visualBeats = sustainBeats * 1.18 + 0.12;
+    const sustainBeats = Math.max(0.25, eventDuration(event, (rightHand[i + 1]?.[1] ?? (beat + 0.75)) - beat));
+    const visualBeats = sustainBeats * 1.08 + 0.08;
     const barHeight = Math.max(24, Math.min(hitLineTop - top + 24, visualBeats * pixelsPerBeat));
     pitches.forEach((midi) => {
       const lane = laneCodeForMidi(midi);
@@ -1416,7 +1559,12 @@ function handleNoteMic(midi) {
 
 function handleNote(midi) {
   if (!state.playing || !state.tracker) return;
-  playNote(midi, 0.6, getInstrumentForPart(state.selectedPart ?? 0));
+  const expectedEvent = getRightHand()[state.tracker.position] ?? getRightHand()[0];
+  playNote(midi, 0.6, getInstrumentForPart(state.selectedPart ?? 0), {
+    duration: expectedEvent ? eventDurationSeconds(expectedEvent, getInstrumentForPart(state.selectedPart ?? 0)) : undefined,
+    pedaled: expectedEvent ? isPedaledEvent(expectedEvent) : false,
+    pedalHold: expectedEvent ? eventPedalHoldSeconds(expectedEvent) : null,
+  });
   const keyId = cueKeyIdForMidi(midi);
   highlightKey(keyId, true);
   setTimeout(() => highlightKey(keyId, false), 120);

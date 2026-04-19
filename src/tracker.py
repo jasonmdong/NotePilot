@@ -32,7 +32,7 @@ class ScoreTracker:
             return None
 
         self.position = matched_idx + 1
-        _, beat = self.score[matched_idx]
+        beat = self.score[matched_idx][1]
         now = time.perf_counter()
 
         self.timestamps.append((now, beat))
@@ -81,5 +81,5 @@ class ScoreTracker:
         """
         if self.position >= len(self.score):
             return None
-        expected_pitch, _ = self.score[self.position]
+        expected_pitch = self.score[self.position][0]
         return self.position if pitch == expected_pitch else None

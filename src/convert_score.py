@@ -16,7 +16,7 @@ import sys
 import os
 import re
 import argparse
-from music21 import converter, note, chord
+from music21 import converter, note, chord, expressions
 from src.paths import get_scores_dir
 
 
@@ -28,17 +28,145 @@ def beat_to_float(beat) -> float:
     return float(beat)
 
 
-def extract_events(part) -> list:
-    """Return [[midi_pitch|[midi_pitches], offset], ...] preserving chords."""
-    notes = []
+def _starts_new_attack(el) -> bool:
+    tie = getattr(el, "tie", None)
+    if tie is None:
+        return True
+    return tie.type not in {"stop", "continue"}
+
+
+def _note_tie_duration(part, start_note) -> float:
+    duration = float(start_note.quarterLength)
+    tie = getattr(start_note, "tie", None)
+    if tie is None or tie.type != "start":
+        return duration
+
+    found_start = False
+    start_pitch = start_note.pitch.midi
+    start_offset = float(start_note.offset)
+    for later in part.flatten().notesAndRests:
+        if isinstance(later, note.Note):
+            members = [later]
+        elif isinstance(later, chord.Chord):
+            members = list(later.notes)
+        else:
+            continue
+
+        later_offset = float(later.offset)
+        if not found_start:
+            if later is start_note or (
+                later_offset == start_offset
+                and any(member is start_note for member in members)
+            ):
+                found_start = True
+            continue
+
+        for member in members:
+            later_tie = getattr(member, "tie", None)
+            if member.pitch.midi != start_pitch or later_tie is None:
+                continue
+            if later_tie.type in {"continue", "stop"}:
+                duration += float(member.quarterLength)
+                if later_tie.type == "stop":
+                    return duration
+    return duration
+
+
+def _pedal_spans(container, anchor=None) -> list[tuple[float, float]]:
+    spans = []
+    anchor = anchor or container
+    for pedal in container.recurse().getElementsByClass(expressions.PedalMark):
+        try:
+            first = pedal.getFirst()
+            last = pedal.getLast()
+            if not first or not last:
+                continue
+            start = float(first.getOffsetInHierarchy(anchor))
+            end = float(last.getOffsetInHierarchy(anchor))
+            if end < start:
+                start, end = end, start
+            spans.append((start, end))
+        except Exception:
+            continue
+    spans.sort(key=lambda item: (item[0], item[1]))
+    return spans
+
+
+def _apply_pedal(events: list, pedal_spans: list[tuple[float, float]]) -> list:
+    if not events or not pedal_spans:
+        return events
+
+    for event in events:
+        beat = float(event[1])
+        end = beat + float(event[2])
+        pedal_release = None
+        for pedal_start, pedal_end in pedal_spans:
+            if pedal_end <= beat:
+                continue
+            if pedal_start > end:
+                break
+            if pedal_start <= beat <= pedal_end or pedal_start <= end <= pedal_end:
+                end = max(end, pedal_end)
+                pedal_release = max(pedal_release or pedal_end, pedal_end)
+        event[2] = max(0.125, end - beat)
+        if pedal_release is not None:
+            if len(event) > 3:
+                event[3] = pedal_release
+            else:
+                event.append(pedal_release)
+
+    next_attack_by_pitch = {}
+    for event in reversed(events):
+        beat = float(event[1])
+        pitches = event[0] if isinstance(event[0], list) else [event[0]]
+        end = beat + float(event[2])
+        pedaled = len(event) > 3 and event[3] is not None
+        for pitch in pitches:
+            next_attack = next_attack_by_pitch.get(pitch)
+            if not pedaled and next_attack is not None and next_attack > beat:
+                end = min(end, next_attack)
+        event[2] = max(0.125, end - beat)
+        for pitch in pitches:
+            next_attack_by_pitch[pitch] = beat
+
+    return events
+
+
+def extract_events(part, pedal_spans: list[tuple[float, float]] | None = None) -> list:
+    """Return [[midi_pitch|[midi_pitches], offset, duration], ...].
+
+    Tied continuations/stops are treated as sustain, not a fresh attack. That
+    keeps held notes from being emitted twice when the notation splits them
+    across beats or measures. Pedal spans extend the event duration so sustained
+    piano writing does not collapse into short detached notes on playback.
+    """
+    grouped = {}
     for el in part.flatten().notesAndRests:
         if isinstance(el, note.Note):
-            notes.append([el.pitch.midi, beat_to_float(el.offset)])
+            if _starts_new_attack(el):
+                beat = beat_to_float(el.offset)
+                slot = grouped.setdefault(beat, {"pitches": [], "duration": 0.0})
+                slot["pitches"].append(el.pitch.midi)
+                slot["duration"] = max(slot["duration"], _note_tie_duration(part, el))
         elif isinstance(el, chord.Chord):
-            pitches = sorted(n.pitch.midi for n in el.notes)
-            notes.append([pitches, beat_to_float(el.offset)])
-    notes.sort(key=lambda x: x[1])
-    return notes
+            attacked = [n for n in el.notes if _starts_new_attack(n)]
+            pitches = [n.pitch.midi for n in attacked]
+            if pitches:
+                beat = beat_to_float(el.offset)
+                slot = grouped.setdefault(beat, {"pitches": [], "duration": 0.0})
+                slot["pitches"].extend(pitches)
+                slot["duration"] = max(slot["duration"], max(_note_tie_duration(part, n) for n in attacked))
+
+    events = []
+    for beat in sorted(grouped.keys()):
+        pitches = sorted(set(grouped[beat]["pitches"]))
+        duration = grouped[beat]["duration"]
+        if not pitches:
+            continue
+        payload = pitches[0] if len(pitches) == 1 else pitches
+        events.append([payload, beat, duration])
+
+    return _apply_pedal(events, pedal_spans if pedal_spans is not None else _pedal_spans(part))
 
 
 def slugify_score_name(raw: str) -> str:
@@ -55,14 +183,18 @@ def write_score_py(
     measure_beats: list[float] | None = None,
 ):
     """
-    parts_data: [{"name": str, "notes": [[pitch_or_pitches, beat], ...]}, ...]
+    parts_data: [{"name": str, "notes": [[pitch_or_pitches, beat, duration, pedal_release?], ...]}, ...]
     Writes PARTS, and also RIGHT_HAND/LEFT_HAND defaulting to part 0 / rest.
     """
     # Default RIGHT_HAND = part 0 melody, LEFT_HAND = all other parts merged
     right = parts_data[0]['notes'] if parts_data else []
     left  = []
     for p in parts_data[1:]:
-        left.extend([[n[0] if isinstance(n[0], list) else [n[0]], n[1]] for n in p['notes']])
+        for n in p['notes']:
+            merged = [n[0] if isinstance(n[0], list) else [n[0]], n[1], n[2]]
+            if len(n) > 3:
+                merged.append(n[3])
+            left.append(merged)
     left.sort(key=lambda x: x[1])
 
     lines = [
@@ -70,7 +202,7 @@ def write_score_py(
         f'# Title: {title}',
         f'# Beat positions are in quarter-note units from the start.',
         f'',
-        f'# All parts — each note is [midi_pitch_or_chord, beat]',
+        f'# All parts — each note is [midi_pitch_or_chord, beat, duration, pedal_release?]',
         f'PARTS = {parts_data!r}',
         f'MEASURE_BEATS = {(measure_beats or [])!r}',
         f'',
@@ -78,7 +210,11 @@ def write_score_py(
         f'RIGHT_HAND = PARTS[0]["notes"] if PARTS else []',
         f'LEFT_HAND  = []',
         f'for _p in PARTS[1:]:',
-        f'    LEFT_HAND.extend([[n[0] if isinstance(n[0], list) else [n[0]], n[1]] for n in _p["notes"]])',
+        f'    for n in _p["notes"]:',
+        f'        _merged = [n[0] if isinstance(n[0], list) else [n[0]], n[1], n[2]]',
+        f'        if len(n) > 3:',
+        f'            _merged.append(n[3])',
+        f'        LEFT_HAND.append(_merged)',
         f'LEFT_HAND.sort(key=lambda x: x[1])',
     ]
 
@@ -95,11 +231,22 @@ def build_parts_data(score) -> list:
     if len(score_parts) == 0:
         raise ValueError("No parts found — is this a valid MusicXML file?")
 
+    global_pedals = _pedal_spans(score, anchor=score)
+    shared_pedal_score = (
+        len(score_parts) <= 2
+        and any(_detect_instrument(part) == "piano" for part in score_parts)
+    )
+
     parts_data = []
     for p in score_parts:
         part_name = p.partName or f"Part {len(parts_data) + 1}"
         instrument = _detect_instrument(p)
-        notes = extract_events(p)
+        local_pedals = _pedal_spans(p, anchor=score)
+        if shared_pedal_score:
+            pedal_spans = sorted(set(local_pedals + global_pedals))
+        else:
+            pedal_spans = local_pedals
+        notes = extract_events(p, pedal_spans=pedal_spans)
         parts_data.append({"name": part_name, "instrument": instrument, "notes": notes})
     return parts_data
 
@@ -331,7 +478,8 @@ def show_melody(name: str = None):
     print("Right-hand melody:")
     print(f"  {'Beat':>6}  {'Note':>5}  Key")
     print(f"  {'----':>6}  {'----':>5}  ---")
-    for pitch, beat in RIGHT_HAND:
+    for event in RIGHT_HAND:
+        pitch, beat = event[0], event[1]
         name = pitch_name(pitch)
         key  = PITCH_TO_KEY.get(pitch, '?')
         print(f"  {beat:>6.2f}  {name:>5}  {key}")

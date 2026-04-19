@@ -15,7 +15,11 @@ def _score_row_to_payload(row: dict) -> dict:
     for part in parts[1:]:
         for event in part.get("notes", []):
             pitches = event[0] if isinstance(event[0], list) else [event[0]]
-            left_hand.append([pitches, event[1]])
+            duration = event[2] if len(event) > 2 else 0.75
+            merged = [pitches, event[1], duration]
+            if len(event) > 3:
+                merged.append(event[3])
+            left_hand.append(merged)
     left_hand.sort(key=lambda event: event[1])
     sheet_html = row.get("sheet_html") or ""
     has_sheet = "<svg" in sheet_html
