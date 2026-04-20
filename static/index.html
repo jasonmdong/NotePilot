@@ -98,7 +98,24 @@
 
 <!-- ── Play screen ── -->
 <div id="play-screen" class="screen">
+  <div class="play-shell">
+  <aside class="play-sidebar">
+    <div class="play-sidebar-header">
+      <div class="play-sidebar-copy">
+        <h3>Pieces</h3>
+        <p>Switch pieces without returning to the gallery.</p>
+      </div>
+      <button
+        id="play-sidebar-toggle"
+        class="play-sidebar-toggle"
+        type="button"
+        onclick="togglePlaySidebar()"
+        aria-label="Collapse piece sidebar">←</button>
+    </div>
+    <div id="play-piece-list" class="play-piece-list"></div>
+  </aside>
 
+  <div class="play-content">
   <div class="play-header">
     <div class="top-row">
       <button class="btn btn-ghost" onclick="showScreen('list-screen')">← Back</button>
@@ -263,6 +280,8 @@
         Raise the gate if false notes fire; lower it if your playing isn't registering.
       </p>
     </div>
+  </div>
+  </div>
   </div>
 
 </div>

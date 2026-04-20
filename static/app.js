@@ -730,6 +730,7 @@ let _sheetHighlightRect = null;
 let _sheetHighlightIndex = -1;
 const SCORE_LIBRARY_KEY = 'accompy_score_library_v1';
 const SCORE_LIBRARY_INIT_KEY = 'accompy_score_library_initialized_v1';
+const PLAY_SIDEBAR_COLLAPSED_KEY = 'accompy_play_sidebar_collapsed_v1';
 let _appConfig = { supabase_enabled: false, auth_enabled: false };
 let _authUser = null;
 const OPENING_GUIDE_LEAD_BEATS = 0.75;
@@ -748,6 +749,25 @@ function showScreen(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
 }
+
+function applyPlaySidebarCollapsed(collapsed) {
+  const shell = document.querySelector('#play-screen .play-shell');
+  const toggle = document.getElementById('play-sidebar-toggle');
+  if (!shell || !toggle) return;
+  const normalized = !!collapsed;
+  shell.dataset.sidebar = normalized ? 'collapsed' : 'open';
+  toggle.textContent = normalized ? '→' : '←';
+  toggle.setAttribute('aria-label', normalized ? 'Expand piece sidebar' : 'Collapse piece sidebar');
+  localStorage.setItem(PLAY_SIDEBAR_COLLAPSED_KEY, normalized ? '1' : '0');
+}
+
+function togglePlaySidebar() {
+  const shell = document.querySelector('#play-screen .play-shell');
+  if (!shell) return;
+  applyPlaySidebarCollapsed(shell.dataset.sidebar !== 'collapsed');
+}
+
+window.togglePlaySidebar = togglePlaySidebar;
 
 function setAuthStatus(message, tone = 'muted') {
   const el = document.getElementById('auth-status');
@@ -783,6 +803,7 @@ function updateAuthUI() {
   } else {
     document.getElementById('score-grid').innerHTML = '<div class="score-preview-empty">Sign in to load your score library.</div>';
   }
+  renderPlayPieceList();
 }
 
 async function initAppConfig() {
@@ -848,6 +869,7 @@ async function signOut() {
   state.scores = [];
   state.serverScores = [];
   updateAuthUI();
+  renderPlayPieceList();
 }
 
 window.signIn = signIn;
@@ -1109,6 +1131,36 @@ async function loadScoreList() {
     sanitizeSheetFrame(frame);
   });
   requestAnimationFrame(() => resizeScorePreviews());
+  renderPlayPieceList();
+}
+
+function renderPlayPieceList() {
+  const root = document.getElementById('play-piece-list');
+  if (!root) return;
+  const currentName = state.current?.name || null;
+  const names = Array.isArray(state.scores) ? state.scores : [];
+
+  if (!names.length) {
+    root.innerHTML = '<div class="score-preview-empty">No pieces in your library yet.</div>';
+    return;
+  }
+
+  root.innerHTML = names.map((name) => {
+    const active = name === currentName;
+    return `
+      <button
+        class="play-piece-item${active ? ' active' : ''}"
+        ${active ? 'disabled' : ''}
+        onclick="openScore('${name}')">
+        <span class="play-piece-title">${formatName(name)}</span>
+        <span class="play-piece-slug">${name}</span>
+      </button>
+    `;
+  }).join('');
+}
+
+function initPlaySidebar() {
+  applyPlaySidebarCollapsed(localStorage.getItem(PLAY_SIDEBAR_COLLAPSED_KEY) === '1');
 }
 
 function formatName(name) {
@@ -1256,6 +1308,7 @@ async function fetchScore(name) {
 }
 
 async function openScore(name) {
+  if (state.playing && state.current?.name !== name) stopPlaying();
   const data = await fetchScore(name);
   state.current = data;
   state.selectedPart = 0;
@@ -1327,6 +1380,7 @@ async function openScore(name) {
   renderNoteHighway();
   syncExpectedMicNote();
   preloadCurrentScoreInstruments();
+  renderPlayPieceList();
   showScreen('play-screen');
   state.paused = false;
   state.pausedBeat = 0;
@@ -2367,6 +2421,7 @@ window.importScoreFiles = importScoreFiles;
 initLatencyControls();
 initImportControls();
 initKeyboardLayoutToggle();
+initPlaySidebar();
 onNoiseGateChange(document.getElementById('noise-gate')?.value || '1');
 setLatencyCompensation(localStorage.getItem('accompy_latency_comp_ms') || '0');
 initAppConfig().then(() => {
