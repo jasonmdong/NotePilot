@@ -716,7 +716,7 @@ let state = {
   paused:           false,
   pausedBeat:       0,
   pausedBps:        1,
-  sheetView: { zoom: 1.0, rotation: 0 },
+  sheetView: { zoom: 1.0, rotation: 0, autoFit: true },
   sheetSource: null, // { name, hasSheet, musicXml }
 };
 
@@ -748,6 +748,9 @@ async function api(path, opts) {
 function showScreen(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
+  if (id === 'play-screen' && typeof fitSheetToWidth === 'function') {
+    requestAnimationFrame(() => fitSheetToWidth());
+  }
 }
 
 function applyPlaySidebarCollapsed(collapsed) {
@@ -1183,6 +1186,7 @@ async function renderMusicXmlFallback(xmlText) {
     });
     await _musicXmlDisplay.load(xmlText);
     _musicXmlDisplay.render();
+    fitSheetToWidth();
     return true;
   } catch (error) {
     console.warn('MusicXML fallback render failed:', error);
@@ -1227,6 +1231,7 @@ function applySheetView() {
 function sheetZoom(delta) {
   const next = Math.max(0.4, Math.min(2.5, (state.sheetView.zoom || 1) + delta));
   state.sheetView.zoom = Math.round(next * 100) / 100;
+  state.sheetView.autoFit = false;
   applySheetView();
 }
 
@@ -1236,13 +1241,56 @@ function sheetRotate() {
 }
 
 function sheetResetView() {
-  state.sheetView = { zoom: 1.0, rotation: 0 };
+  state.sheetView = { zoom: 1.0, rotation: 0, autoFit: true };
   applySheetView();
+  fitSheetToWidth();
 }
 
 function resetSheetView() {
-  state.sheetView = { zoom: 1.0, rotation: 0 };
+  state.sheetView = { zoom: 1.0, rotation: 0, autoFit: true };
   applySheetView();
+}
+
+function fitSheetToWidth(retry = 0) {
+  if (!state.sheetView?.autoFit) return;
+  const viewer = document.getElementById('sheet-viewer');
+  const frame = document.getElementById('sheet-frame');
+  const fallback = document.getElementById('sheet-musicxml-fallback');
+  if (!viewer) return;
+
+  const frameVisible = frame && frame.style.display !== 'none';
+  const fallbackVisible = fallback && fallback.style.display !== 'none';
+  const viewerWidth = viewer.clientWidth;
+
+  const retryLater = () => {
+    if (retry < 8) setTimeout(() => fitSheetToWidth(retry + 1), 80);
+  };
+
+  if (frameVisible) {
+    const doc = frame.contentDocument;
+    if (!doc?.documentElement) { retryLater(); return; }
+    const prev = doc.documentElement.style.zoom;
+    doc.documentElement.style.zoom = '1';
+    // Measure the actual page element — scrollWidth is clamped to viewport
+    // when the iframe is wider than the fixed 210mm page.
+    const page = doc.querySelector('.page');
+    let natural = page?.getBoundingClientRect().width || 0;
+    if (!natural) {
+      const svg = doc.querySelector('.page svg, svg');
+      natural = svg?.getBoundingClientRect().width || 0;
+    }
+    if (!natural) natural = doc.body?.scrollWidth || doc.documentElement.scrollWidth || 0;
+    doc.documentElement.style.zoom = prev;
+    if (!natural || !viewerWidth) { retryLater(); return; }
+    const z = Math.max(0.4, Math.min(2.5, viewerWidth / natural));
+    state.sheetView.zoom = Math.round(z * 100) / 100;
+    applySheetView();
+  } else if (fallbackVisible && _musicXmlDisplay) {
+    if (!viewerWidth) { retryLater(); return; }
+    // OSMD's autoResize already paginates to the host width — keep zoom at 1.
+    state.sheetView.zoom = 1.0;
+    applySheetView();
+  }
 }
 
 function triggerDownload(blob, filename) {
@@ -1334,6 +1382,7 @@ async function openScore(name) {
     frame.onload = () => {
       sanitizeSheetFrame(frame);
       initializeSheetHighlighting();
+      fitSheetToWidth();
     };
     frame.src = `/api/scores/${name}/sheet?v=${encodeURIComponent(data._mtime ?? Date.now())}`;
     frame.style.display = 'block';
@@ -1942,10 +1991,11 @@ function togglePausePlaying() {
   syncExpectedMicNote();
 }
 
-function stopPlaying() {
+function stopPlaying(reason = 'stopped') {
   if (state.accompanist) state.accompanist.stop();
   _stopMic();
   stopNoteHighwayLoop();
+  const finished = reason === 'finished' && !!state.tracker?.isFinished?.();
   state.playing = false;
   state.paused = false;
   state.pausedBeat = 0;
@@ -1957,7 +2007,12 @@ function stopPlaying() {
   startBtn.textContent = '▶ Start';
   startBtn.classList.add('btn-primary');
   stopBtn.textContent = '■ End';
-  document.getElementById('next-note-display').textContent = '—';
+  if (finished) {
+    document.getElementById('next-note-display').textContent = 'Finished';
+    document.getElementById('progress-fill').style.width = '100%';
+  } else {
+    document.getElementById('next-note-display').textContent = '—';
+  }
   if (typeof _pitchDetector?.setExpectedMidi === 'function') _pitchDetector.setExpectedMidi(null);
   renderNoteHighway();
 }
@@ -1980,7 +2035,7 @@ function handleNoteMic(midi) {
     updateNextKey(getRightHand(), state.tracker.position);
     syncExpectedMicNote();
   }
-  if (state.tracker.isFinished()) stopPlaying();
+  if (state.tracker.isFinished()) stopPlaying('finished');
 }
 
 function handleNote(midi) {
@@ -2012,7 +2067,7 @@ function handleNote(midi) {
     updateNextKey(getRightHand(), state.tracker.position);
   }
 
-  if (state.tracker.isFinished()) stopPlaying();
+  if (state.tracker.isFinished()) stopPlaying('finished');
 }
 
 function handleMidiNote(midi) {
@@ -2042,7 +2097,7 @@ function handleMidiNote(midi) {
     updateNextKey(getRightHand(), state.tracker.position);
   }
 
-  if (state.tracker.isFinished()) stopPlaying();
+  if (state.tracker.isFinished()) stopPlaying('finished');
 }
 
 // ── Input mode ───────────────────────────────────────────────────────────────
@@ -2274,6 +2329,58 @@ applyScoreGridColumns(state.scoreGridColumns);
 applyKeyboardLayoutMode(state.keyboardLayoutMode);
 applyTheme(localStorage.getItem('accompy_theme') || 'dark');
 window.addEventListener('resize', resizeScorePreviews);
+
+let _sheetFitTimer = null;
+function scheduleSheetFit() {
+  if (!state.sheetView?.autoFit) return;
+  clearTimeout(_sheetFitTimer);
+  _sheetFitTimer = setTimeout(fitSheetToWidth, 80);
+}
+window.addEventListener('resize', scheduleSheetFit);
+const _sheetViewerEl = document.getElementById('sheet-viewer');
+if (_sheetViewerEl && typeof ResizeObserver !== 'undefined') {
+  new ResizeObserver(scheduleSheetFit).observe(_sheetViewerEl);
+}
+
+// ── Click-to-play on keyboard keys ───────────────────────────────────────────
+function midiFromKeyboardEl(el) {
+  const refKey = el.closest?.('.ref-key');
+  if (refKey) {
+    const midi = parseInt(refKey.dataset.midi, 10);
+    return Number.isFinite(midi) ? { midi, highlightId: refKey.id } : null;
+  }
+  const kbKey = el.closest?.('.kb-key');
+  if (kbKey?.id?.startsWith('kbslot-')) {
+    const slotId = kbKey.id.slice('kbslot-'.length);
+    const slot = VISUAL_SLOTS.find((s) => s.id === slotId);
+    if (slot) return { midi: 60 + slot.pitchClass, highlightId: kbKey.id };
+  }
+  return null;
+}
+
+const _keyboardSectionEl = document.getElementById('keyboard-section');
+if (_keyboardSectionEl) {
+  _keyboardSectionEl.addEventListener('click', (e) => {
+    const hit = midiFromKeyboardEl(e.target);
+    if (!hit) return;
+    if (typeof Tone !== 'undefined' && Tone.start) Tone.start().catch(() => {});
+    if (state.playing && !state.paused && state.tracker) {
+      // Same flow as a physical keypress — plays the note and advances the tracker.
+      handleNote(hit.midi);
+      return;
+    }
+    // Preview mode — piece isn't running; just play the note + flash the key.
+    const instrument = getInstrumentForPart(state.selectedPart ?? 0);
+    const sampledInstrument = SAMPLE_ALIAS[instrument] || instrument;
+    if (_sampleSamplers[sampledInstrument]) {
+      playNote(hit.midi, 0.6, instrument, { duration: 0.45 });
+    } else {
+      playSynthNote(hit.midi, 0.6, 'piano', { duration: 0.45 });
+    }
+    highlightKey(hit.highlightId, true);
+    setTimeout(() => highlightKey(hit.highlightId, false), 180);
+  });
+}
 
 function onSearchInput() {
   clearTimeout(_searchTimer);
