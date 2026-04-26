@@ -186,14 +186,28 @@
   <!-- Sheet music -->
   <div class="sheet-section">
     <div class="sheet-header">
-      <h4>Sheet music</h4>
+      <div class="sheet-title-row">
+        <h4>Sheet music</h4>
+        <span id="sheet-fingering-status" class="sheet-status-badge" style="display:none"></span>
+      </div>
       <div class="sheet-toolbar">
+        <button id="sheet-generate-fingering-btn" class="sheet-action-btn" onclick="generateSheetFingering()" style="display:none">Generate fingering</button>
+        <button id="sheet-toggle-fingering-btn" class="sheet-action-btn" onclick="toggleSheetFingering()" style="display:none">Show fingering</button>
         <button class="sheet-tool-btn" onclick="sheetZoom(-0.1)" title="Zoom out" aria-label="Zoom out">−</button>
         <span id="sheet-zoom-label" class="sheet-zoom-label">100%</span>
         <button class="sheet-tool-btn" onclick="sheetZoom(0.1)" title="Zoom in" aria-label="Zoom in">+</button>
         <button class="sheet-tool-btn" onclick="sheetResetView()" title="Reset view" aria-label="Reset view">⟲</button>
         <button class="sheet-tool-btn" onclick="sheetRotate()" title="Rotate 90°" aria-label="Rotate">↻</button>
         <button class="sheet-tool-btn" onclick="sheetDownload()" title="Download source" aria-label="Download">⬇</button>
+      </div>
+    </div>
+    <div id="sheet-fingering-progress" class="sheet-fingering-progress" style="display:none">
+      <div class="sheet-fingering-progress-meta">
+        <span id="sheet-fingering-progress-message">Generating fingering</span>
+        <span id="sheet-fingering-progress-value">0%</span>
+      </div>
+      <div class="sheet-fingering-progress-bar" aria-hidden="true">
+        <div id="sheet-fingering-progress-fill" class="sheet-fingering-progress-fill"></div>
       </div>
     </div>
     <div class="sheet-viewer" id="sheet-viewer">

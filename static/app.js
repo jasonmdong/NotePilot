@@ -706,6 +706,7 @@ let state = {
   scores:           [],
   serverScores:     [],
   current:          null,
+  fingeringJob:     null,
   tracker:          null,
   accompanist:      null,
   playing:          false,
@@ -717,7 +718,8 @@ let state = {
   pausedBeat:       0,
   pausedBps:        1,
   sheetView: { zoom: 1.0, rotation: 0 },
-  sheetSource: null, // { name, hasSheet, musicXml }
+  sheetSource: null, // { name, variant, hasSheet, musicXml }
+  sheetVariant: 'base',
 };
 
 let _noteHighwayRaf = null;
@@ -728,6 +730,7 @@ let _noteHighwayBps = 1;
 let _sheetMeasureEls = [];
 let _sheetHighlightRect = null;
 let _sheetHighlightIndex = -1;
+let _fingeringJobPollTimer = null;
 const SCORE_LIBRARY_KEY = 'accompy_score_library_v1';
 const SCORE_LIBRARY_INIT_KEY = 'accompy_score_library_initialized_v1';
 const PLAY_SIDEBAR_COLLAPSED_KEY = 'accompy_play_sidebar_collapsed_v1';
@@ -742,6 +745,16 @@ async function api(path, opts) {
   const r = await fetch(path, request);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
+}
+
+function readApiErrorMessage(error) {
+  const fallback = error?.message || String(error);
+  try {
+    const parsed = JSON.parse(fallback);
+    return parsed.detail || fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 // ── Screens ──────────────────────────────────────────────────────────────────
@@ -863,11 +876,16 @@ async function signUp() {
 }
 
 async function signOut() {
+  if (state.playing) stopPlaying();
+  clearFingeringJobPolling();
+  setFingeringJob(null);
   await api('/api/logout', { method: 'POST' });
   _authUser = null;
   state.current = null;
   state.scores = [];
   state.serverScores = [];
+  state.sheetSource = null;
+  state.sheetVariant = 'base';
   updateAuthUI();
   renderPlayPieceList();
 }
@@ -1266,20 +1284,299 @@ function triggerDownload(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+async function loadSheetIntoFrame(frame, url) {
+  const response = await fetch(url, { cache: 'no-store' });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  const html = await response.text();
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      resolve();
+    };
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      reject(error);
+    };
+    const onLoad = () => {
+      requestAnimationFrame(() => finish());
+    };
+    const timeoutId = setTimeout(() => {
+      const doc = frame.contentDocument;
+      if (doc?.documentElement?.innerHTML?.trim()) {
+        finish();
+        return;
+      }
+      fail(new Error('Sheet frame failed to load.'));
+    }, 1500);
+
+    frame.addEventListener('load', onLoad, { once: true });
+    frame.removeAttribute('src');
+    frame.srcdoc = html;
+  });
+}
+
+function clearFingeringJobPolling() {
+  if (_fingeringJobPollTimer) {
+    clearTimeout(_fingeringJobPollTimer);
+    _fingeringJobPollTimer = null;
+  }
+}
+
+function setFingeringJob(job) {
+  state.fingeringJob = job || null;
+  updateSheetFingeringStatus();
+  updateFingeringProgressUI();
+}
+
+function currentSheetVariant() {
+  return state.current?.fingering?.applied && state.sheetVariant === 'fingered'
+    ? 'fingered'
+    : 'base';
+}
+
+function currentSheetAssets() {
+  const data = state.current || {};
+  if (currentSheetVariant() === 'fingered') {
+    return {
+      variant: 'fingered',
+      hasSheet: !!(data.has_fingered_sheet || data.fingered_musicxml_source),
+      musicXml: data.fingered_musicxml_source || null,
+    };
+  }
+  return {
+    variant: 'base',
+    hasSheet: !!(data.has_sheet || data.musicxml_source),
+    musicXml: data.musicxml_source || null,
+  };
+}
+
+function updateFingeringProgressUI() {
+  const root = document.getElementById('sheet-fingering-progress');
+  const fill = document.getElementById('sheet-fingering-progress-fill');
+  const message = document.getElementById('sheet-fingering-progress-message');
+  const value = document.getElementById('sheet-fingering-progress-value');
+  if (!root || !fill || !message || !value) return;
+
+  const job = state.fingeringJob;
+  if (!job || !['queued', 'running'].includes(job.status)) {
+    root.style.display = 'none';
+    fill.style.width = '0%';
+    message.textContent = 'Generating fingering';
+    value.textContent = '0%';
+    return;
+  }
+
+  const progress = Math.max(0, Math.min(100, Math.round(Number(job.progress || 0))));
+  root.style.display = 'block';
+  fill.style.width = `${progress}%`;
+  message.textContent = job.message || 'Generating fingering';
+  value.textContent = `${progress}%`;
+}
+
+function updateSheetFingeringStatus() {
+  const badge = document.getElementById('sheet-fingering-status');
+  const generateBtn = document.getElementById('sheet-generate-fingering-btn');
+  const toggleBtn = document.getElementById('sheet-toggle-fingering-btn');
+  if (!badge || !generateBtn || !toggleBtn) return;
+
+  const fingering = state.current?.fingering;
+  const job = state.fingeringJob;
+  const hideBadge = () => {
+    badge.style.display = 'none';
+    badge.textContent = '';
+    badge.title = '';
+    delete badge.dataset.state;
+  };
+
+  if (!fingering) {
+    generateBtn.style.display = 'none';
+    toggleBtn.style.display = 'none';
+    hideBadge();
+    return;
+  }
+
+  const generating = !!job && ['queued', 'running'].includes(job.status);
+  if (generating) {
+    const progress = Math.max(0, Math.min(100, Math.round(Number(job.progress || 0))));
+    badge.style.display = 'inline-flex';
+    badge.dataset.state = 'ok';
+    badge.textContent = 'Generating fingering';
+    badge.title = job.message || '';
+    generateBtn.style.display = 'inline-flex';
+    generateBtn.disabled = true;
+    generateBtn.textContent = progress > 0 ? `Generating ${progress}%` : 'Generating…';
+    toggleBtn.style.display = 'none';
+    return;
+  }
+
+  const applied = !!fingering.applied;
+  const eligible = !!fingering.eligible;
+  const available = fingering.available !== false;
+  const showingFingered = currentSheetVariant() === 'fingered';
+
+  if (applied) {
+    badge.style.display = 'inline-flex';
+    badge.dataset.state = 'ok';
+    badge.textContent = showingFingered ? 'Showing fingering' : 'Fingering ready';
+    badge.title = fingering.annotations ? `${fingering.annotations} annotated notes` : '';
+    generateBtn.style.display = 'none';
+    toggleBtn.style.display = 'inline-flex';
+    toggleBtn.disabled = false;
+    toggleBtn.textContent = showingFingered ? 'Hide fingering' : 'Show fingering';
+    return;
+  }
+
+  toggleBtn.style.display = 'none';
+  if (eligible && available) {
+    badge.style.display = 'inline-flex';
+    badge.dataset.state = 'ok';
+    badge.textContent = 'Fingering available';
+    badge.title = 'Generate a beginner fingering version for this score.';
+    generateBtn.style.display = 'inline-flex';
+    generateBtn.disabled = false;
+    generateBtn.textContent = 'Generate fingering';
+    return;
+  }
+
+  generateBtn.style.display = 'none';
+  if (!eligible || !available) {
+    badge.style.display = 'inline-flex';
+    badge.dataset.state = 'warning';
+    badge.textContent = 'Fingering unavailable';
+    badge.title = !eligible
+      ? 'Automatic fingering is currently limited to scores with one or two parts.'
+      : 'PianoPlayer is not installed in the backend environment.';
+    return;
+  }
+
+  hideBadge();
+}
+
+async function pollFingeringJob(scoreName, jobId) {
+  clearFingeringJobPolling();
+
+  const tick = async () => {
+    if (!state.current || state.current.name !== scoreName) {
+      clearFingeringJobPolling();
+      return;
+    }
+
+    try {
+      const job = await api(`/api/scores/${encodeURIComponent(scoreName)}/fingering/jobs/${encodeURIComponent(jobId)}`);
+      if (!state.current || state.current.name !== scoreName) return;
+
+      if (job.status === 'completed') {
+        clearFingeringJobPolling();
+        setFingeringJob(null);
+        state.sheetVariant = 'fingered';
+        await openScore(scoreName, {
+          preserveSelectedPart: true,
+          preserveSheetVariant: true,
+          reveal: false,
+        });
+        return;
+      }
+
+      if (job.status === 'failed') {
+        clearFingeringJobPolling();
+        setFingeringJob(null);
+        alert(`Failed to generate fingering: ${job.error || job.message || 'Unknown error.'}`);
+        return;
+      }
+
+      setFingeringJob(job);
+      _fingeringJobPollTimer = setTimeout(tick, 500);
+    } catch (error) {
+      clearFingeringJobPolling();
+      setFingeringJob(null);
+      alert(`Failed to check fingering progress: ${readApiErrorMessage(error)}`);
+    }
+  };
+
+  await tick();
+}
+
+async function renderScoreSheet() {
+  const data = state.current;
+  if (!data) return;
+
+  const frame = document.getElementById('sheet-frame');
+  const placeholder = document.getElementById('sheet-placeholder');
+  const musicXmlFallback = document.getElementById('sheet-musicxml-fallback');
+  const assets = currentSheetAssets();
+
+  musicXmlFallback.style.display = 'none';
+  musicXmlFallback.innerHTML = '';
+  frame.style.display = 'none';
+  frame.onload = null;
+  placeholder.style.display = 'none';
+  state.sheetSource = {
+    name: data.name,
+    variant: assets.variant,
+    hasSheet: assets.hasSheet,
+    musicXml: assets.musicXml,
+  };
+  updateSheetFingeringStatus();
+  updateFingeringProgressUI();
+
+  if (assets.hasSheet) {
+    try {
+      await loadSheetIntoFrame(
+        frame,
+        `/api/scores/${encodeURIComponent(data.name)}/sheet?variant=${encodeURIComponent(assets.variant)}&v=${encodeURIComponent(Date.now())}`
+      );
+      sanitizeSheetFrame(frame);
+      initializeSheetHighlighting();
+      frame.style.display = 'block';
+      return;
+    } catch (error) {
+      console.warn(`Sheet render failed for ${data.name} (${assets.variant})`, error);
+    }
+  }
+
+  frame.srcdoc = '';
+  const renderedFallback = assets.musicXml
+    ? await renderMusicXmlFallback(assets.musicXml)
+    : false;
+  placeholder.style.display = renderedFallback ? 'none' : 'block';
+  placeholder.textContent = renderedFallback ? '' : 'Sheet preview unavailable for this score.';
+  clearSheetHighlight();
+}
+
+async function toggleSheetFingering() {
+  if (!state.current?.fingering?.applied) return;
+  state.sheetVariant = currentSheetVariant() === 'fingered' ? 'base' : 'fingered';
+  await renderScoreSheet();
+}
+
+async function generateSheetFingering() {
+  const current = state.current;
+  const button = document.getElementById('sheet-generate-fingering-btn');
+  if (!current || !current.fingering?.eligible || current.fingering?.applied || !button || state.fingeringJob) return;
+
+  if (state.playing) stopPlaying();
+  try {
+    const job = await api(`/api/scores/${encodeURIComponent(current.name)}/fingering/generate`, {
+      method: 'POST',
+    });
+    setFingeringJob(job);
+    await pollFingeringJob(current.name, job.id);
+  } catch (error) {
+    alert(`Failed to generate fingering: ${readApiErrorMessage(error)}`);
+  }
+}
+
 async function sheetDownload() {
   const src = state.sheetSource;
   if (!src || !src.name) {
     alert('Open a score first.');
-    return;
-  }
-  if (src.hasSheet) {
-    try {
-      const resp = await fetch(`/api/scores/${encodeURIComponent(src.name)}/sheet`);
-      const html = await resp.text();
-      triggerDownload(new Blob([html], { type: 'text/html' }), `${src.name}.sheet.html`);
-    } catch (err) {
-      alert(`Download failed: ${err}`);
-    }
     return;
   }
   if (src.musicXml) {
@@ -1289,87 +1586,66 @@ async function sheetDownload() {
     );
     return;
   }
+  if (src.hasSheet) {
+    try {
+      const resp = await fetch(
+        `/api/scores/${encodeURIComponent(src.name)}/sheet?variant=${encodeURIComponent(src.variant || 'base')}`,
+        { cache: 'no-store' }
+      );
+      if (!resp.ok) throw new Error(await resp.text());
+      const html = await resp.text();
+      triggerDownload(new Blob([html], { type: 'text/html' }), `${src.name}.sheet.html`);
+    } catch (err) {
+      alert(`Download failed: ${readApiErrorMessage(err)}`);
+    }
+    return;
+  }
   alert('No sheet source available to download.');
 }
 
 // ── Play screen ───────────────────────────────────────────────────────────────
 async function fetchScore(name) {
-  const scope = _appConfig.auth_enabled
-    ? (_authUser?.id || _authUser?.username || 'auth')
-    : 'local';
-  const CACHE_KEY = `accompy_score_v2_${scope}_${name}`;
-  try {
-    // Cheap mtime check first
-    const { mtime } = await api(`/api/scores/${name}/meta`);
-    const cached = localStorage.getItem(CACHE_KEY);
-    if (cached) {
-      const parsed = JSON.parse(cached);
-      if (parsed._mtime === mtime && Array.isArray(parsed.measure_beats)) return parsed;
-    }
-    // Cache miss — fetch full data
-    const data = await api(`/api/scores/${name}`);
-    data._mtime = mtime;
-    localStorage.setItem(CACHE_KEY, JSON.stringify(data));
-    return data;
-  } catch {
-    // Fallback: fetch without caching
-    return api(`/api/scores/${name}`);
-  }
+  return api(`/api/scores/${encodeURIComponent(name)}`);
 }
 
-async function openScore(name) {
+async function openScore(name, options = {}) {
+  const preserveSelectedPart = !!options.preserveSelectedPart;
+  const preserveSheetVariant = !!options.preserveSheetVariant;
+  const reveal = options.reveal !== false;
   if (state.playing && state.current?.name !== name) stopPlaying();
+  clearFingeringJobPolling();
+  if (state.current?.name !== name) setFingeringJob(null);
+
+  const previousPart = preserveSelectedPart ? (state.selectedPart ?? 0) : 0;
+  const previousVariant = preserveSheetVariant ? state.sheetVariant : 'base';
   const data = await fetchScore(name);
   state.current = data;
-  state.selectedPart = 0;
+  const parts = data.parts || [];
+  state.selectedPart = parts.length
+    ? Math.max(0, Math.min(previousPart, parts.length - 1))
+    : 0;
   state.partInstruments = {};
+  state.sheetVariant = (previousVariant === 'fingered' && data.fingering?.applied) ? 'fingered' : 'base';
   _stopMic();
   setInputMode('keyboard');
 
-  document.getElementById('play-title').textContent = formatName(name);
+  document.getElementById('play-title').textContent = data.title || formatName(name);
   document.getElementById('progress-fill').style.width = '0%';
   document.getElementById('next-note-display').textContent = '—';
   document.getElementById('beat-val').textContent  = '—';
   document.getElementById('tempo-val').textContent = '—';
 
-  // Sheet music
-  const frame = document.getElementById('sheet-frame');
-  const placeholder = document.getElementById('sheet-placeholder');
-  const musicXmlFallback = document.getElementById('sheet-musicxml-fallback');
-  musicXmlFallback.style.display = 'none';
-  musicXmlFallback.innerHTML = '';
-  state.sheetSource = { name, hasSheet: !!data.has_sheet, musicXml: data.musicxml_source || null };
   resetSheetView();
-  if (data.has_sheet) {
-    frame.onload = () => {
-      sanitizeSheetFrame(frame);
-      initializeSheetHighlighting();
-    };
-    frame.src = `/api/scores/${name}/sheet?v=${encodeURIComponent(data._mtime ?? Date.now())}`;
-    frame.style.display = 'block';
-    placeholder.style.display = 'none';
-  } else {
-    frame.onload = null;
-    frame.style.display = 'none';
-    const renderedFallback = data.musicxml_source
-      ? await renderMusicXmlFallback(data.musicxml_source)
-      : false;
-    placeholder.style.display = renderedFallback ? 'none' : 'block';
-    placeholder.textContent = renderedFallback
-      ? ''
-      : 'Sheet preview unavailable for this score.';
-    clearSheetHighlight();
-  }
+  await renderScoreSheet();
 
   // Part picker
-  const parts = data.parts || [];
   const picker = document.getElementById('part-picker');
   const btns   = document.getElementById('part-buttons');
   if (parts.length > 0) {
     btns.innerHTML = parts.map((p, i) => {
       const instr = p.instrument || 'piano';
       return `<div class="part-row" id="part-row-${i}">
-        <button class="part-btn${i === 0 ? ' selected' : ''}"
+        <button class="part-btn${i === state.selectedPart ? ' selected' : ''}"
                 onclick="selectPart(${i})" id="part-btn-${i}">
           ${p.name}
         </button>
@@ -1391,7 +1667,7 @@ async function openScore(name) {
   syncExpectedMicNote();
   preloadCurrentScoreInstruments();
   renderPlayPieceList();
-  showScreen('play-screen');
+  if (reveal) showScreen('play-screen');
   state.paused = false;
   state.pausedBeat = 0;
   state.pausedBps = 1;
@@ -1420,13 +1696,15 @@ function getInstrumentForPart(idx) {
 
 async function changeInstrument(partIdx, instrument) {
   state.partInstruments[partIdx] = instrument;
+  if (state.current?.parts?.[partIdx]) {
+    state.current.parts[partIdx].instrument = instrument;
+  }
   try {
     await api(`/api/scores/${state.current.name}/instrument`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ part_index: partIdx, instrument }),
     });
-    localStorage.removeItem(`accompy_score_${state.current.name}`);
   } catch { /* non-critical — change is applied in-memory either way */ }
   preloadCurrentScoreInstruments();
 }
@@ -2409,7 +2687,7 @@ async function addPiece(corpusPath, safeName) {
   } catch (e) {
     item.classList.remove('adding');
     item.querySelector('button').textContent = '+ Add';
-    alert(`Failed to convert: ${e.message}`);
+    alert(`Failed to convert: ${readApiErrorMessage(e)}`);
   }
 }
 

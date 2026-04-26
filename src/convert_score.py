@@ -17,6 +17,7 @@ import os
 import re
 import argparse
 from music21 import converter, note, chord, expressions
+from src.fingering import build_fingering_state
 from src.paths import get_scores_dir
 
 
@@ -304,6 +305,7 @@ def convert_score_source(source: str, *, name: str | None = None, out_dir: str |
         "source_ref": source,
         "measure_beats": measure_beats,
         "render_source_path": str(render_source_path),
+        "fingering": build_fingering_state(parts_data),
     }
 
 
