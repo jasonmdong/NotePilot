@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     python3-venv \
     wget \
+    xauth \
     xvfb \
     && rm -rf /var/lib/apt/lists/*
 
@@ -27,7 +28,7 @@ RUN wget -O /tmp/audiveris.deb \
     && rm -f /tmp/audiveris.deb \
     && rm -rf /var/lib/apt/lists/*
 
-RUN xvfb-run -a /opt/audiveris/bin/Audiveris -help >/dev/null
+RUN xvfb-run -a /opt/audiveris/bin/Audiveris -batch -help >/dev/null
 
 RUN useradd -m -u 1000 user
 
