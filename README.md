@@ -21,7 +21,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Web UI
+## Webapp
 
 ```bash
 python run.py
