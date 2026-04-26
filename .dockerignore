@@ -1,0 +1,10 @@
+.git
+.gitignore
+.venv
+.accompy_scores
+node_modules
+MuseScore
+docs/images
+__pycache__
+*.pyc
+

@@ -1,3 +1,12 @@
+---
+title: accompy
+emoji: 🎹
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+pinned: false
+---
+
 # Accompy
 
 A real-time accompanist (for now for piano ideally lol). Select right/left hand, then accompy tracks your tempo and accompanies automatically.
