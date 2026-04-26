@@ -8,7 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PATH="/home/user/.local/bin:$PATH" \
-    AUDIVERIS_BIN="xvfb-run -a audiveris"
+    AUDIVERIS_BIN="xvfb-run -a /opt/audiveris/bin/Audiveris"
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
@@ -27,7 +27,7 @@ RUN wget -O /tmp/audiveris.deb \
     && rm -f /tmp/audiveris.deb \
     && rm -rf /var/lib/apt/lists/*
 
-RUN xvfb-run -a audiveris -help >/dev/null
+RUN xvfb-run -a /opt/audiveris/bin/Audiveris -help >/dev/null
 
 RUN useradd -m -u 1000 user
 
