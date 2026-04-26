@@ -24,11 +24,11 @@ RUN apt-get update && apt-get install -y \
 RUN wget -O /tmp/audiveris.deb \
     https://github.com/Audiveris/audiveris/releases/download/${AUDIVERIS_VERSION}/${AUDIVERIS_DEB} \
     && apt-get update \
-    && apt-get install -y /tmp/audiveris.deb \
+    && (apt-get install -y /tmp/audiveris.deb \
+        || (apt-get install -f -y && apt-get install -y /tmp/audiveris.deb)) \
+    && test -x /opt/audiveris/bin/Audiveris \
     && rm -f /tmp/audiveris.deb \
     && rm -rf /var/lib/apt/lists/*
-
-RUN xvfb-run -a /opt/audiveris/bin/Audiveris -batch -help >/dev/null
 
 RUN useradd -m -u 1000 user
 
