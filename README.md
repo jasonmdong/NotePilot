@@ -1,3 +1,13 @@
+---
+title: accompy
+emoji: 🎹
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Accompy
 
 A real-time accompanist (for now for piano ideally lol). Select right/left hand, then accompy tracks your tempo and accompanies automatically.
@@ -23,13 +33,3 @@ Open [http://localhost:8000](http://localhost:8000) to browse scores, add new pi
 ### Inspiration
 
 A small project of mine that I always wanted to do. Had the idea two years ago but never got the motivation to implement it.
-
----
-title: accompy
-emoji: 🎹
-colorFrom: blue
-colorTo: indigo
-sdk: docker
-app_port: 7860
-pinned: false
----
