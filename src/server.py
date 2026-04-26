@@ -12,6 +12,7 @@ Endpoints:
 
 import os
 import re
+import shlex
 import tempfile
 import subprocess
 import hashlib
@@ -181,9 +182,9 @@ def prepare_omr_input(upload_paths: list[Path], work_dir: Path) -> Path:
 
 
 def run_audiveris(input_path: Path, output_dir: Path):
-    audiveris_bin = os.getenv("AUDIVERIS_BIN", "audiveris")
+    audiveris_bin = os.getenv("AUDIVERIS_BIN", "audiveris").strip() or "audiveris"
     command = [
-        audiveris_bin,
+        *shlex.split(audiveris_bin),
         "-batch",
         "-transcribe",
         "-export",
