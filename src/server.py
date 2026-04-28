@@ -30,7 +30,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from src.env import load_local_env
 from src.convert_score import convert_score_source, render_html, slugify_score_name
-from src.fingering import apply_auto_fingering, normalize_fingering_state
+from src.fingering import apply_auto_fingering, normalize_fingering_state, stack_fingering_chord_numbers_in_html
 from src.paths import get_static_dir
 from src.storage import create_score_store, SupabaseScoreStore, _score_row_to_payload
 
@@ -190,7 +190,13 @@ def ensure_fingering_state(score: dict) -> dict:
     return normalized
 
 
-def render_sheet_html_from_musicxml_text(score_name: str, title: str, xml_text: str) -> str:
+def render_sheet_html_from_musicxml_text(
+    score_name: str,
+    title: str,
+    xml_text: str,
+    *,
+    stack_fingering_chords: bool = False,
+) -> str:
     if not (xml_text or "").strip():
         return ""
     with tempfile.TemporaryDirectory(prefix="accompy_sheet_variant_") as tmp_dir:
@@ -199,7 +205,8 @@ def render_sheet_html_from_musicxml_text(score_name: str, title: str, xml_text: 
         html_path = tmp_path / f"{score_name}.html"
         xml_path.write_text(xml_text, encoding="utf-8")
         render_html(str(xml_path), str(html_path), title)
-        return html_path.read_text(encoding="utf-8") if html_path.exists() else ""
+        html = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
+        return stack_fingering_chord_numbers_in_html(html) if stack_fingering_chords else html
 
 
 def build_fingered_score_variant(score: dict, progress_callback=None) -> tuple[str, str, dict]:
@@ -644,13 +651,17 @@ def get_sheet(name: str, request: Request, variant: str = "base"):
     title = score.get("title") or score.get("name") or name
     score_data = row.get("score_data") or {}
     if variant == "fingered":
-        html = (score_data.get("fingered_sheet_html") or "").strip()
-        if (not html or "<svg" not in html) and score.get("fingered_musicxml_source"):
+        html = ""
+        if score.get("fingered_musicxml_source"):
             html = render_sheet_html_from_musicxml_text(
                 score.get("name") or name,
                 title,
                 score.get("fingered_musicxml_source") or "",
+                stack_fingering_chords=True,
             )
+        if not html or "<svg" not in html:
+            html = (score_data.get("fingered_sheet_html") or "").strip()
+            html = stack_fingering_chord_numbers_in_html(html)
     else:
         html = (row.get("sheet_html") or score.get("sheet_html") or "").strip()
         if (not html or "<svg" not in html) and score.get("musicxml_source"):
