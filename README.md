@@ -12,7 +12,7 @@ pinned: false
 
 A real-time accompanist (for now for piano ideally lol). Select right/left hand, then accompy tracks your tempo and accompanies automatically. Demo available [here](https://jasonmdong-accompy.hf.space/).
 
-![Accompy demo](docs/images/demo.png)
+![Accompy demo](docs/images/demo_v2.png)
 
 ## Setup
 
