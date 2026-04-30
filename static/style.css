@@ -302,17 +302,18 @@ body.auth-mode .auth-form input {
 }
 
 .auth-actions {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: .65rem;
   align-items: stretch;
 }
 
 .auth-actions .btn {
-  flex: 1 1 0;
-  min-width: 0;
+  width: 100%;
   min-height: 42px;
   justify-content: center;
-  white-space: nowrap;
+  white-space: normal;
+  text-align: center;
 }
 
 .guest-signin-btn {
@@ -327,7 +328,7 @@ body.auth-mode .auth-actions .btn {
 
 @media (max-width: 620px) {
   .auth-actions {
-    flex-direction: column;
+    grid-template-columns: 1fr;
   }
 }
 

@@ -612,15 +612,7 @@ def start_google_auth(request: Request):
     if not (supabase_url and anon_key):
         raise HTTPException(status_code=400, detail="Google sign-in requires SUPABASE_URL and SUPABASE_ANON_KEY.")
 
-    configured_origin = os.getenv("APP_PUBLIC_URL", "").strip().rstrip("/")
-    if configured_origin:
-        origin = configured_origin
-    else:
-        origin = str(request.base_url).rstrip("/")
-        forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
-        forwarded_host = request.headers.get("x-forwarded-host", "").split(",", 1)[0].strip()
-        if forwarded_proto and forwarded_host:
-            origin = f"{forwarded_proto}://{forwarded_host}"
+    origin = public_app_origin(request)
     redirect_to = f"{origin}/auth/callback"
     auth_url = (
         f"{supabase_url}/auth/v1/authorize"
@@ -628,6 +620,38 @@ def start_google_auth(request: Request):
         f"&redirect_to={quote(redirect_to, safe='')}"
     )
     return RedirectResponse(auth_url, status_code=302)
+
+
+def public_app_origin(request: Request) -> str:
+    configured_origin = os.getenv("APP_PUBLIC_URL", "").strip().rstrip("/")
+    if configured_origin:
+        return configured_origin
+
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
+    forwarded_host = request.headers.get("x-forwarded-host", "").split(",", 1)[0].strip()
+    forwarded_port = request.headers.get("x-forwarded-port", "").split(",", 1)[0].strip()
+    if forwarded_proto and forwarded_host:
+        host = forwarded_host
+        if forwarded_port and ":" not in host and forwarded_port not in {"80", "443"}:
+            host = f"{host}:{forwarded_port}"
+        return f"{forwarded_proto}://{host}"
+
+    for header_name in ("x-original-host", "x-real-host", "host"):
+        host = request.headers.get(header_name, "").split(",", 1)[0].strip()
+        if host and not host.startswith(("127.0.0.1", "localhost")):
+            proto = forwarded_proto or "https"
+            return f"{proto}://{host}"
+
+    space_host = os.getenv("SPACE_HOST", "").strip().rstrip("/")
+    if space_host:
+        return space_host if space_host.startswith(("http://", "https://")) else f"https://{space_host}"
+
+    space_id = os.getenv("SPACE_ID", "").strip()
+    if "/" in space_id:
+        owner, space = space_id.split("/", 1)
+        return f"https://{owner}-{space.replace('_', '-')}.hf.space"
+
+    return str(request.base_url).rstrip("/")
 
 
 @app.post("/api/auth/supabase-token")
