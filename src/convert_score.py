@@ -857,16 +857,47 @@ def render_html(mxl_path: str, out_path: str, title: str):
   <meta charset="utf-8">
   <title>{title}</title>
   <style>
-    body {{ margin: 0; background: #eee; font-family: sans-serif; }}
-    h1   {{ text-align: center; padding: 1rem; font-size: 1.1rem; color: #333; }}
+    :root {{
+      color-scheme: light;
+      --notepilot-sheet-outer: #f4f1ea;
+      --notepilot-sheet-page: #ffffff;
+      --notepilot-sheet-ink: #111318;
+      --notepilot-sheet-shadow: 0 2px 6px rgba(0,0,0,.3);
+    }}
+    :root[data-notepilot-theme="dark"] {{
+      color-scheme: dark;
+      --notepilot-sheet-outer: #0f0f13;
+      --notepilot-sheet-page: #181824;
+      --notepilot-sheet-ink: #f2efe8;
+      --notepilot-sheet-shadow: 0 6px 18px rgba(0,0,0,.55);
+    }}
+    body {{ margin: 0; background: var(--notepilot-sheet-outer); color: var(--notepilot-sheet-ink); font-family: sans-serif; }}
+    h1   {{ text-align: center; padding: 1rem; font-size: 1.1rem; color: var(--notepilot-sheet-ink); }}
     .page {{
-      background: white;
+      background: var(--notepilot-sheet-page);
       width: 210mm;
       margin: 1rem auto;
-      box-shadow: 0 2px 6px rgba(0,0,0,.3);
+      box-shadow: var(--notepilot-sheet-shadow);
       page-break-after: always;
     }}
-    .page svg {{ width: 100%; height: auto; display: block; }}
+    .page svg {{ width: 100%; height: auto; display: block; color: var(--notepilot-sheet-ink); }}
+    :root[data-notepilot-theme="dark"] svg :is(path, ellipse, polygon, polyline, line, text, tspan, use):not(.accompy-measure-highlight) {{
+      fill: var(--notepilot-sheet-ink) !important;
+      stroke: var(--notepilot-sheet-ink) !important;
+    }}
+    :root[data-notepilot-theme="dark"] svg rect:not(.accompy-measure-highlight) {{
+      fill: var(--notepilot-sheet-ink) !important;
+      stroke: var(--notepilot-sheet-ink) !important;
+    }}
+    :root[data-notepilot-theme="dark"] svg [fill="none"] {{ fill: none !important; }}
+    :root[data-notepilot-theme="dark"] svg [stroke="none"] {{ stroke: none !important; }}
+    :root[data-notepilot-theme="dark"] svg rect[fill="white"],
+    :root[data-notepilot-theme="dark"] svg rect[fill="#ffffff"],
+    :root[data-notepilot-theme="dark"] svg rect[fill="#FFF"],
+    :root[data-notepilot-theme="dark"] svg rect[fill="#fff"] {{
+      fill: var(--notepilot-sheet-page) !important;
+      stroke: var(--notepilot-sheet-page) !important;
+    }}
     @media print {{
       body {{ background: white; }}
       h1   {{ display: none; }}

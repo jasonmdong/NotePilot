@@ -812,6 +812,7 @@ let state = {
   pausedBeat:       0,
   pausedBps:        1,
   finishedPlayback: false,
+  guestMode:        false,
   sheetView: { zoom: 1.0, rotation: 0 },
   sheetSource: null, // { name, variant, hasSheet, musicXml }
   sheetVariant: 'base',
@@ -833,11 +834,41 @@ const PLAY_SIDEBAR_COLLAPSED_KEY = 'accompy_play_sidebar_collapsed_v1';
 const PRACTICE_SPLIT_KEY = 'accompy_practice_split_v1';
 const SHELL_SPLIT_KEY = 'accompy_shell_split_px_v1';
 const PANEL_SPLIT_KEY = 'accompy_panel_split_px_v1';
+const GUEST_MODE_KEY = 'notepilot_guest_mode_v1';
+const GUEST_PROGRESS_KEY = 'notepilot_guest_progress_v1';
 const PRACTICE_SPLITTER_SIZE = 12;
 const LAYOUT_SPLITTER_SIZE = 12;
 let _appConfig = { supabase_enabled: false, auth_enabled: false };
 let _authUser = null;
 const OPENING_GUIDE_LEAD_BEATS = 0.75;
+
+const GUEST_DEMO_SCORES = [
+  {
+    name: 'guest_beginner_demo',
+    title: 'Beginner Demo Piece',
+    subtitle: 'A short C major melody that shows following, tempo, and the keyboard visualizer.',
+    cta: 'Try your first piece',
+    primary: true,
+    measure_beats: [0, 4, 8, 12],
+    tips: [
+      'Start at 60 BPM and play the highlighted notes with A S D J K.',
+      'Watch the green guide move as NotePilot follows your tempo.',
+      'Try switching to Mini keyboard after the first run.',
+    ],
+    parts: [
+      {
+        name: 'Melody',
+        instrument: 'piano',
+        notes: [[60, 0, 1], [62, 1, 1], [64, 2, 1], [67, 3, 1], [69, 4, 1], [67, 5, 1], [64, 6, 1], [62, 7, 1], [60, 8, 2], [62, 10, 1], [60, 11, 1], [60, 12, 2]],
+      },
+      {
+        name: 'Accompaniment',
+        instrument: 'piano',
+        notes: [[[48, 55], 0, 4], [[53, 57], 4, 4], [[48, 55], 8, 1], [[47, 55], 9, 3], [[48, 52, 55], 12, 2]],
+      },
+    ],
+  },
+];
 
 // ── API helpers ──────────────────────────────────────────────────────────────
 async function api(path, opts) {
@@ -856,6 +887,135 @@ function readApiErrorMessage(error) {
   } catch {
     return fallback;
   }
+}
+
+function loadGuestProgress() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(GUEST_PROGRESS_KEY) || '{}');
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveGuestProgress(progress) {
+  localStorage.setItem(GUEST_PROGRESS_KEY, JSON.stringify(progress || {}));
+}
+
+function guestScoreByName(name) {
+  return GUEST_DEMO_SCORES.find((score) => score.name === name) || null;
+}
+
+function isGuestScoreName(name) {
+  return !!guestScoreByName(name);
+}
+
+function displayNameForScore(name) {
+  return guestScoreByName(name)?.title || formatName(name);
+}
+
+function guestScorePayload(score) {
+  const parts = score.parts.map((part) => ({
+    name: part.name,
+    instrument: part.instrument || 'piano',
+    notes: part.notes.map((note) => Array.isArray(note) ? [...note] : note),
+  }));
+  return {
+    name: score.name,
+    title: score.title,
+    source_type: 'guest',
+    guest: true,
+    has_sheet: false,
+    has_fingered_sheet: false,
+    sheet_html: '',
+    musicxml_source: guestMusicXml(score),
+    fingered_musicxml_source: '',
+    fingering: { eligible: false, available: false, applied: false },
+    measure_beats: score.measure_beats || [0, 4, 8],
+    parts,
+    right_hand: parts[0]?.notes || [],
+    left_hand: parts.slice(1).flatMap((part) => part.notes),
+    tips: score.tips || [],
+  };
+}
+
+function guestMusicXml(score) {
+  const starts = score.measure_beats || [0];
+  const parts = score.parts?.length ? score.parts : [];
+  const partList = parts.map((part, index) =>
+    `<score-part id="P${index + 1}"><part-name>${escapeXml(part.name || `Part ${index + 1}`)}</part-name></score-part>`
+  ).join('');
+  const partXml = parts.map((part, partIndex) => {
+    const measures = starts.map((start, measureIndex) => {
+      const end = starts[measureIndex + 1] ?? start + 4;
+      return guestMeasureXml(part.notes || [], start, end, measureIndex, partIndex);
+    }).join('');
+    return `<part id="P${partIndex + 1}">${measures}</part>`;
+  }).join('');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <work><work-title>${escapeXml(score.title)}</work-title></work>
+  <part-list>${partList}</part-list>
+  ${partXml}
+</score-partwise>`;
+}
+
+function guestMeasureXml(events, start, end, measureIndex, partIndex) {
+  const attrs = measureIndex === 0
+    ? `<attributes><divisions>4</divisions><key><fifths>0</fifths></key><time><beats>4</beats><beat-type>4</beat-type></time><clef><sign>${partIndex === 0 ? 'G' : 'F'}</sign><line>${partIndex === 0 ? '2' : '4'}</line></clef></attributes>`
+    : '';
+  const measureEvents = [...events]
+    .filter((event) => event[1] >= start && event[1] < end)
+    .sort((a, b) => a[1] - b[1]);
+  let cursor = start;
+  const notes = [];
+  measureEvents.forEach((event) => {
+    const beat = Math.max(start, Number(event[1]) || start);
+    if (beat > cursor) notes.push(guestRestXml(beat - cursor));
+    const eventBeats = Math.min(eventDuration(event, 1), end - beat);
+    notes.push(guestEventXml(event, eventBeats));
+    cursor = Math.max(cursor, beat + eventBeats);
+  });
+  if (cursor < end) notes.push(guestRestXml(end - cursor));
+  return `<measure number="${measureIndex + 1}">${attrs}${notes.join('') || guestRestXml(end - start)}</measure>`;
+}
+
+function guestEventXml(event, beats) {
+  const pitches = eventPitches(event);
+  if (!pitches.length) return guestRestXml(beats);
+  return pitches.map((pitch, index) => guestNoteXml(pitch, beats, index > 0)).join('');
+}
+
+function guestNoteXml(pitch, beats, chord = false) {
+  const duration = Math.max(1, Math.round(Math.max(0.25, beats || 1) * 4));
+  const { step, alter, octave } = midiPitchParts(pitch);
+  const type = duration >= 8 ? 'half' : duration >= 4 ? 'quarter' : duration >= 2 ? 'eighth' : '16th';
+  return `<note>${chord ? '<chord/>' : ''}<pitch><step>${step}</step>${alter ? `<alter>${alter}</alter>` : ''}<octave>${octave}</octave></pitch><duration>${duration}</duration><type>${type}</type></note>`;
+}
+
+function guestRestXml(beats) {
+  const duration = Math.max(1, Math.round(Math.max(0.25, beats || 1) * 4));
+  const type = duration >= 16 ? 'whole' : duration >= 8 ? 'half' : duration >= 4 ? 'quarter' : duration >= 2 ? 'eighth' : '16th';
+  return `<note><rest/><duration>${duration}</duration><type>${type}</type></note>`;
+}
+
+function midiPitchParts(midi) {
+  const names = [
+    ['C', 0], ['C', 1], ['D', 0], ['D', 1], ['E', 0], ['F', 0],
+    ['F', 1], ['G', 0], ['G', 1], ['A', 0], ['A', 1], ['B', 0],
+  ];
+  const [step, alter] = names[midi % 12];
+  return { step, alter, octave: Math.floor(midi / 12) - 1 };
+}
+
+function escapeXml(value) {
+  return String(value ?? '').replace(/[<>&'"]/g, (char) => ({
+    '<': '&lt;',
+    '>': '&gt;',
+    '&': '&amp;',
+    "'": '&apos;',
+    '"': '&quot;',
+  }[char]));
 }
 
 // ── Screens ──────────────────────────────────────────────────────────────────
@@ -927,16 +1087,46 @@ function updateAuthUI() {
   const panel = document.getElementById('auth-panel');
   const loggedOut = document.getElementById('auth-logged-out');
   const addPieceBtn = document.getElementById('add-piece-btn');
+  const guestBanner = document.getElementById('guest-banner');
+  const playGuestBanner = document.getElementById('play-guest-banner');
   const navAuthUser = document.getElementById('nav-auth-user');
   const navUsername = document.getElementById('nav-auth-username');
   const googleBtn = document.getElementById('google-signin-btn');
   const googleDivider = document.getElementById('google-auth-divider');
+  const libraryTitle = document.getElementById('library-title');
+  const librarySubtitle = document.getElementById('library-subtitle');
   if (!panel || !loggedOut || !addPieceBtn) return;
+  updateSidebarAccountUI();
+  document.body.classList.toggle('guest-mode', state.guestMode);
+  if (guestBanner) guestBanner.style.display = state.guestMode ? 'flex' : 'none';
+  if (playGuestBanner) playGuestBanner.style.display = state.guestMode ? 'block' : 'none';
+  if (libraryTitle) libraryTitle.textContent = state.guestMode ? 'Demo Library' : 'Your Library';
+  if (librarySubtitle) {
+    librarySubtitle.textContent = state.guestMode
+      ? 'Try a guided NotePilot sandbox. Demo changes stay on this device.'
+      : 'Choose a piece, set your part, and let NotePilot follow your tempo.';
+  }
+
+  if (state.guestMode) {
+    document.body.classList.remove('auth-mode');
+    panel.style.display = 'none';
+    loggedOut.style.display = 'none';
+    addPieceBtn.disabled = false;
+    addPieceBtn.textContent = '+ Add piece';
+    if (navAuthUser) navAuthUser.style.display = 'none';
+    if (navUsername) navUsername.textContent = '';
+    renderPlayPieceList();
+    return;
+  }
+
   if (!_appConfig.auth_enabled) {
     document.body.classList.remove('auth-mode');
     panel.style.display = 'none';
+    if (guestBanner) guestBanner.style.display = 'none';
+    if (playGuestBanner) playGuestBanner.style.display = 'none';
     if (navAuthUser) navAuthUser.style.display = 'none';
     addPieceBtn.disabled = false;
+    addPieceBtn.textContent = '+ Add piece';
     return;
   }
 
@@ -947,6 +1137,7 @@ function updateAuthUI() {
   if (googleBtn) googleBtn.style.display = _appConfig.google_auth_enabled ? 'inline-flex' : 'none';
   if (googleDivider) googleDivider.style.display = _appConfig.google_auth_enabled ? 'flex' : 'none';
   addPieceBtn.disabled = !isLoggedIn;
+  addPieceBtn.textContent = '+ Add piece';
   if (navAuthUser) navAuthUser.style.display = isLoggedIn ? 'flex' : 'none';
   if (isLoggedIn) {
     if (navUsername) navUsername.textContent = _authUser.email || _authUser.username || 'Signed in';
@@ -957,6 +1148,78 @@ function updateAuthUI() {
   }
   renderPlayPieceList();
 }
+
+function accountLabel() {
+  if (state.guestMode) return 'Guest Mode';
+  return _authUser?.email || _authUser?.username || 'Not signed in';
+}
+
+function accountInitials() {
+  if (state.guestMode) return 'G';
+  const label = accountLabel();
+  if (!label || label === 'Not signed in') return '?';
+  const parts = label.split(/[@\s._-]+/).filter(Boolean);
+  return (parts.length >= 2 ? parts[0][0] + parts[1][0] : label.slice(0, 1)).toUpperCase();
+}
+
+function updateSidebarAccountUI() {
+  const button = document.getElementById('sidebar-account-btn');
+  const name = document.getElementById('sidebar-account-name');
+  const detail = document.getElementById('sidebar-account-detail');
+  const action = document.getElementById('sidebar-account-action');
+  if (!button || !name || !detail || !action) return;
+
+  button.textContent = accountInitials();
+  name.textContent = accountLabel();
+  if (state.guestMode) {
+    detail.textContent = 'Demo changes stay on this device.';
+    action.textContent = 'Create Account';
+  } else if (_authUser) {
+    detail.textContent = 'Signed in to NotePilot.';
+    action.textContent = 'Log out';
+  } else {
+    detail.textContent = 'Sign in to save your library.';
+    action.textContent = 'Sign in';
+  }
+}
+
+function toggleSidebarAccountMenu(force) {
+  const popover = document.getElementById('sidebar-account-popover');
+  const button = document.getElementById('sidebar-account-btn');
+  if (!popover || !button) return;
+  const shouldOpen = typeof force === 'boolean' ? force : popover.style.display === 'none';
+  popover.style.display = shouldOpen ? 'block' : 'none';
+  button.setAttribute('aria-expanded', shouldOpen ? 'true' : 'false');
+  if (shouldOpen) updateSidebarAccountUI();
+}
+
+function sidebarAccountAction() {
+  toggleSidebarAccountMenu(false);
+  if (state.guestMode) {
+    showCreateAccountPrompt('Create a free account to save your own pieces and progress.');
+    return;
+  }
+  if (_authUser) {
+    signOut();
+    return;
+  }
+  showScreen('list-screen');
+  updateScoreUrl(null, true);
+  updateAuthUI();
+}
+
+document.addEventListener('click', (event) => {
+  const menu = document.querySelector('.sidebar-account-menu');
+  if (!menu || menu.contains(event.target)) return;
+  toggleSidebarAccountMenu(false);
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') toggleSidebarAccountMenu(false);
+});
+
+window.toggleSidebarAccountMenu = toggleSidebarAccountMenu;
+window.sidebarAccountAction = sidebarAccountAction;
 
 async function completeGoogleRedirectIfNeeded() {
   const params = new URLSearchParams(window.location.hash.replace(/^#/, ''));
@@ -985,12 +1248,17 @@ async function completeGoogleRedirectIfNeeded() {
 }
 
 async function initAppConfig() {
+  state.guestMode = localStorage.getItem(GUEST_MODE_KEY) === '1';
   try {
     _appConfig = await api('/api/config');
     if (_appConfig.auth_enabled) {
       await completeGoogleRedirectIfNeeded();
       const session = await api('/api/session');
       _authUser = session.user || null;
+      if (_authUser) {
+        state.guestMode = false;
+        localStorage.removeItem(GUEST_MODE_KEY);
+      }
     }
   } catch (error) {
     _appConfig = { supabase_enabled: false, auth_enabled: false };
@@ -1011,8 +1279,10 @@ async function signIn() {
       body: JSON.stringify({ username, password }),
     });
     _authUser = result.user || null;
-    updateAuthUI();
+    state.guestMode = false;
+    localStorage.removeItem(GUEST_MODE_KEY);
     await loadScoreList();
+    updateAuthUI();
     await openRouteFromLocation({ replace: true });
     setAuthStatus('Signed in.', 'success');
   } catch (error) {
@@ -1033,8 +1303,10 @@ async function signUp() {
       body: JSON.stringify({ username, password }),
     });
     _authUser = result.user || null;
-    updateAuthUI();
+    state.guestMode = false;
+    localStorage.removeItem(GUEST_MODE_KEY);
     await loadScoreList();
+    updateAuthUI();
     await openRouteFromLocation({ replace: true });
     setAuthStatus('Account created.', 'success');
   } catch (error) {
@@ -1069,10 +1341,61 @@ async function signOut() {
   showScreen('list-screen');
 }
 
+async function continueAsGuest() {
+  if (state.playing) stopPlaying();
+  _authUser = null;
+  state.guestMode = true;
+  state.current = null;
+  state.scores = GUEST_DEMO_SCORES.map((score) => score.name);
+  state.serverScores = [];
+  localStorage.setItem(GUEST_MODE_KEY, '1');
+  hideUpgradeToast();
+  updateAuthUI();
+  updateScoreUrl(null, true);
+  showScreen('list-screen');
+  await loadScoreList();
+}
+
+async function resetGuestDemo() {
+  localStorage.removeItem(GUEST_PROGRESS_KEY);
+  hideUpgradeToast();
+  if (state.guestMode) await loadScoreList();
+}
+
+function showCreateAccountPrompt(message = 'Create a free account to save your own pieces and progress.') {
+  if (state.playing) stopPlaying();
+  state.guestMode = false;
+  localStorage.removeItem(GUEST_MODE_KEY);
+  hideUpgradeToast();
+  updateScoreUrl(null, true);
+  updateAuthUI();
+  showScreen('list-screen');
+  setAuthStatus(message, 'success');
+  setTimeout(() => document.getElementById('auth-email')?.focus(), 50);
+}
+
+function showGuestUpgradeToast(message) {
+  if (!state.guestMode) return;
+  const toast = document.getElementById('upgrade-toast');
+  const messageEl = document.getElementById('upgrade-toast-message');
+  if (!toast || !messageEl) return;
+  messageEl.textContent = message || 'Create a free account to save your own pieces and progress.';
+  toast.style.display = 'block';
+}
+
+function hideUpgradeToast() {
+  const toast = document.getElementById('upgrade-toast');
+  if (toast) toast.style.display = 'none';
+}
+
 window.signIn = signIn;
 window.signUp = signUp;
 window.signInWithGoogle = signInWithGoogle;
 window.signOut = signOut;
+window.continueAsGuest = continueAsGuest;
+window.resetGuestDemo = resetGuestDemo;
+window.showCreateAccountPrompt = showCreateAccountPrompt;
+window.hideUpgradeToast = hideUpgradeToast;
 
 function loadPersonalScoreLibrary() {
   if (_appConfig.auth_enabled) return [...(state.serverScores || [])];
@@ -1408,6 +1731,7 @@ function applyTheme(theme) {
   });
   localStorage.setItem('accompy_theme', normalized);
   document.querySelectorAll('#sheet-frame, .score-preview-frame').forEach((frame) => sanitizeSheetFrame(frame));
+  applyMusicXmlFallbackTheme();
 }
 
 function toggleTheme() {
@@ -1428,6 +1752,7 @@ function sanitizeSheetFrame(frame) {
   const doc = frame?.contentDocument;
   if (!doc) return;
   const darkMode = !document.body.classList.contains('light');
+  const themeName = darkMode ? 'dark' : 'light';
 
   doc.querySelectorAll('h1').forEach((el) => el.remove());
 
@@ -1439,22 +1764,28 @@ function sanitizeSheetFrame(frame) {
   }
 
   style.textContent = `
+    :root {
+      color-scheme: ${themeName};
+      --notepilot-sheet-outer: ${darkMode ? '#0f0f13' : '#f4f1ea'};
+      --notepilot-sheet-page: ${darkMode ? '#181824' : '#ffffff'};
+      --notepilot-sheet-ink: ${darkMode ? '#f2efe8' : '#111318'};
+    }
     h1 { display: none !important; }
     body {
       padding-top: 0 !important;
       margin-top: 0 !important;
-      background: ${darkMode ? '#0f0f13' : '#f4f1ea'} !important;
-      color: ${darkMode ? '#f2efe8' : '#111318'} !important;
+      background: var(--notepilot-sheet-outer) !important;
+      color: var(--notepilot-sheet-ink) !important;
     }
     .page {
-      background: ${darkMode ? '#181824' : '#ffffff'} !important;
+      background: var(--notepilot-sheet-page) !important;
       box-shadow: ${darkMode ? '0 6px 18px rgba(0,0,0,.55)' : '0 2px 6px rgba(0,0,0,.18)'} !important;
       max-width: none !important;
       margin: 0 auto 1rem !important;
       box-sizing: border-box !important;
     }
     svg {
-      color: ${darkMode ? '#f2efe8' : '#111318'} !important;
+      color: var(--notepilot-sheet-ink) !important;
     }
     svg :is(path, ellipse, polygon, polyline, line, text, tspan, use):not(.accompy-measure-highlight) {
       ${darkMode ? 'fill: #f2efe8 !important; stroke: #f2efe8 !important;' : ''}
@@ -1475,17 +1806,26 @@ function sanitizeSheetFrame(frame) {
     svg rect[fill="#ffffff"],
     svg rect[fill="#FFF"],
     svg rect[fill="#fff"] {
-      fill: ${darkMode ? '#181824' : '#ffffff'} !important;
-      stroke: ${darkMode ? '#181824' : '#ffffff'} !important;
+      fill: var(--notepilot-sheet-page) !important;
+      stroke: var(--notepilot-sheet-page) !important;
     }
   `;
-  doc.documentElement.style.colorScheme = darkMode ? 'dark' : 'light';
+  doc.documentElement.dataset.notepilotTheme = themeName;
+  doc.documentElement.style.colorScheme = themeName;
   if (darkMode) {
     doc.body?.classList.add('accompy-dark-sheet');
+    doc.body?.classList.remove('accompy-light-sheet');
   } else {
     doc.body?.classList.remove('accompy-dark-sheet');
+    doc.body?.classList.add('accompy-light-sheet');
   }
   applySheetFrameZoom(frame, state.sheetView?.zoom || 1);
+}
+
+function applyMusicXmlFallbackTheme() {
+  const host = document.getElementById('sheet-musicxml-fallback');
+  if (!host) return;
+  host.dataset.theme = document.body.classList.contains('light') ? 'light' : 'dark';
 }
 
 function applySheetFrameZoom(frame, zoom = 1) {
@@ -1507,6 +1847,10 @@ function applySheetFrameZoom(frame, zoom = 1) {
 
 // ── Score list screen ─────────────────────────────────────────────────────────
 async function loadScoreList() {
+  if (state.guestMode) {
+    renderGuestDashboard();
+    return;
+  }
   if (_appConfig.auth_enabled && !_authUser) {
     updateAuthUI();
     return;
@@ -1529,6 +1873,15 @@ async function loadScoreList() {
       .map((name) => itemByName.get(name))
       .filter(Boolean);
   }
+  if (scoreItems.length === 0) {
+    grid.innerHTML = `
+      <div class="score-grid-empty">
+        <h3>Your library is empty</h3>
+        <p>Click <strong>+ Add piece</strong> at the top right to get started!</p>
+      </div>`;
+    renderPlayPieceList();
+    return;
+  }
   grid.innerHTML = scoreItems.map(({ name, has_sheet }) => `
     <div class="score-card" id="card-${name}" onclick="openScore('${name}')">
       <button class="delete-btn" onclick="deleteScore(event, '${name}')" title="Remove from my list">✕</button>
@@ -1544,7 +1897,7 @@ async function loadScoreList() {
         }
       </div>
       <div class="score-card-meta">
-        <h3>${formatName(name)}</h3>
+        <h3>${displayNameForScore(name)}</h3>
         <small>${name}</small>
       </div>
     </div>
@@ -1553,6 +1906,37 @@ async function loadScoreList() {
     frame.addEventListener('load', () => sanitizeSheetFrame(frame), { once: true });
     sanitizeSheetFrame(frame);
   });
+  requestAnimationFrame(() => resizeScorePreviews());
+  renderPlayPieceList();
+}
+
+function renderGuestDashboard() {
+  updateAuthUI();
+  applyScoreGridColumns(state.scoreGridColumns);
+  const grid = document.getElementById('score-grid');
+  if (!grid) return;
+  const progress = loadGuestProgress();
+  state.scores = GUEST_DEMO_SCORES.map((score) => score.name);
+  grid.innerHTML = GUEST_DEMO_SCORES.map((score) => {
+    const completed = !!progress[score.name]?.completed;
+    const primary = score.primary ? ' primary' : '';
+    return `
+      <div class="score-card guest-demo-card${primary}" id="card-${score.name}" onclick="openScore('${score.name}')">
+        <div class="guest-demo-preview" aria-hidden="true">
+          <span>${score.primary ? 'Guided demo' : 'Sandbox'}</span>
+          <strong>${score.title.split(' ')[0]}</strong>
+        </div>
+        <div class="score-card-meta">
+          <div class="guest-demo-kicker">${completed ? 'Completed demo' : (score.primary ? 'Start here' : 'Included demo')}</div>
+          <h3>${score.title}</h3>
+          <small>${score.subtitle}</small>
+        </div>
+        <button class="btn ${score.primary ? 'btn-primary' : 'btn-ghost'} guest-card-action" type="button" onclick="event.stopPropagation(); openScore('${score.name}')">
+          ${completed ? 'Replay demo' : score.cta}
+        </button>
+      </div>
+    `;
+  }).join('');
   requestAnimationFrame(() => resizeScorePreviews());
   renderPlayPieceList();
 }
@@ -1575,7 +1959,7 @@ function renderPlayPieceList() {
         class="play-piece-item${active ? ' active' : ''}"
         ${active ? 'disabled' : ''}
         onclick="openScore('${name}')">
-        <span class="play-piece-title">${formatName(name)}</span>
+        <span class="play-piece-title">${displayNameForScore(name)}</span>
         <span class="play-piece-slug">${name}</span>
       </button>
     `;
@@ -1606,6 +1990,7 @@ async function renderMusicXmlFallback(xmlText) {
     });
     await _musicXmlDisplay.load(xmlText);
     _musicXmlDisplay.render();
+    applyMusicXmlFallbackTheme();
     return true;
   } catch (error) {
     console.warn('MusicXML fallback render failed:', error);
@@ -1921,7 +2306,7 @@ async function renderScoreSheet() {
   updateSheetFingeringStatus();
   updateFingeringProgressUI();
 
-  if (assets.hasSheet) {
+  if (assets.hasSheet && !(data.guest && assets.musicXml)) {
     try {
       await loadSheetIntoFrame(
         frame,
@@ -1955,6 +2340,10 @@ async function generateSheetFingering() {
   const current = state.current;
   const button = document.getElementById('sheet-generate-fingering-btn');
   if (!current || !current.fingering?.eligible || current.fingering?.applied || !button || state.fingeringJob) return;
+  if (state.guestMode || current.guest) {
+    showGuestUpgradeToast('Create a free account to generate and save fingering for your own pieces.');
+    return;
+  }
 
   if (state.playing) stopPlaying();
   try {
@@ -1972,6 +2361,10 @@ async function sheetDownload() {
   const src = state.sheetSource;
   if (!src || !src.name) {
     alert('Open a score first.');
+    return;
+  }
+  if (state.guestMode || state.current?.guest) {
+    showGuestUpgradeToast('Create a free account to export and save your own work.');
     return;
   }
   if (src.musicXml) {
@@ -2000,8 +2393,56 @@ async function sheetDownload() {
 
 // ── Play screen ───────────────────────────────────────────────────────────────
 async function fetchScore(name) {
+  const guestScore = guestScoreByName(name);
+  if (guestScore) return guestScorePayload(guestScore);
   return api(`/api/scores/${encodeURIComponent(name)}`);
 }
+
+function renderGuestTips(data) {
+  const card = document.getElementById('guest-tips-card');
+  const list = document.getElementById('guest-tips-list');
+  if (!card || !list) return;
+  const tips = data?.guest ? (data.tips || []) : [];
+  card.style.display = tips.length ? 'block' : 'none';
+  list.innerHTML = tips.map((tip) => `<li>${escapeHtml(tip)}</li>`).join('');
+  renderGuestAnnotations();
+}
+
+function escapeHtml(value) {
+  const div = document.createElement('div');
+  div.textContent = String(value ?? '');
+  return div.innerHTML;
+}
+
+function guestAnnotationsForCurrent() {
+  if (!state.current?.guest) return [];
+  const progress = loadGuestProgress();
+  return Array.isArray(progress[state.current.name]?.annotations)
+    ? progress[state.current.name].annotations
+    : [];
+}
+
+function renderGuestAnnotations() {
+  const root = document.getElementById('guest-annotation-list');
+  if (!root) return;
+  const annotations = guestAnnotationsForCurrent();
+  root.innerHTML = annotations.length
+    ? annotations.map((annotation) => `<span>${escapeHtml(annotation)}</span>`).join('')
+    : '<small>No demo annotations yet.</small>';
+}
+
+function addGuestAnnotation(text) {
+  if (!state.current?.guest) return;
+  const progress = loadGuestProgress();
+  const item = progress[state.current.name] || {};
+  const annotations = Array.isArray(item.annotations) ? item.annotations : [];
+  annotations.push(text);
+  progress[state.current.name] = { ...item, annotations: annotations.slice(-5) };
+  saveGuestProgress(progress);
+  renderGuestAnnotations();
+}
+
+window.addGuestAnnotation = addGuestAnnotation;
 
 async function openScore(name, options = {}) {
   const preserveSelectedPart = !!options.preserveSelectedPart;
@@ -2016,6 +2457,7 @@ async function openScore(name, options = {}) {
   const previousVariant = preserveSheetVariant ? state.sheetVariant : 'base';
   const data = await fetchScore(name);
   state.current = data;
+  renderGuestTips(data);
   state.finishedPlayback = false;
   state.practiceRightHand = null;
   state.practiceLeftHand = null;
@@ -2085,6 +2527,7 @@ async function openRouteFromLocation(options = {}) {
     showScreen('list-screen');
     return;
   }
+  showScreen('play-screen');
   try {
     await openScore(name, { updateUrl: false });
     if (options.replace) updateScoreUrl(name, true);
@@ -2121,6 +2564,10 @@ async function changeInstrument(partIdx, instrument) {
   state.partInstruments[partIdx] = instrument;
   if (state.current?.parts?.[partIdx]) {
     state.current.parts[partIdx].instrument = instrument;
+  }
+  if (state.current?.guest) {
+    preloadCurrentScoreInstruments();
+    return;
   }
   try {
     await api(`/api/scores/${state.current.name}/instrument`, {
@@ -2727,6 +3174,16 @@ function stopPlaying(reason = 'stopped') {
   if (finished) {
     document.getElementById('next-note-display').textContent = 'Finished';
     document.getElementById('progress-fill').style.width = '100%';
+    if (state.guestMode && state.current?.guest) {
+      const progress = loadGuestProgress();
+      progress[state.current.name] = {
+        ...(progress[state.current.name] || {}),
+        completed: true,
+        completedAt: new Date().toISOString(),
+      };
+      saveGuestProgress(progress);
+      showGuestUpgradeToast('Nice run. Create a free account to save your own pieces and progress.');
+    }
   } else {
     document.getElementById('next-note-display').textContent = '—';
   }
@@ -3001,29 +3458,59 @@ document.addEventListener('keydown', e => {
 });
 
 // ── Web MIDI input ────────────────────────────────────────────────────────────
-function setMidiBadge(stateClass, text) {
+function setMidiBadge(stateClass, text, title = '') {
   const badge = document.getElementById('midi-status');
   const label = document.getElementById('midi-status-text');
   if (!badge || !label) return;
   badge.classList.remove('midi-badge-connected', 'midi-badge-disconnected', 'midi-badge-unsupported');
   badge.classList.add(stateClass);
   label.textContent = text;
+  badge.title = title || 'MIDI piano status';
+}
+
+function isVirtualMidiInput(input) {
+  const label = `${input?.name || ''} ${input?.manufacturer || ''}`.toLowerCase();
+  if (!label.trim()) return false;
+  return [
+    'iac driver',
+    'network session',
+    'session 1',
+    'python midi',
+    'midi output',
+    'loopmidi',
+    'loopbe',
+    'virtual',
+    'through port',
+    'midi through',
+  ].some((needle) => label.includes(needle));
 }
 
 function refreshMidiInputs(access) {
   const inputs = Array.from(access.inputs.values());
-  _midiConnected = inputs.length > 0;
-  for (const input of inputs) {
+  const pianoInputs = inputs.filter((input) => input.state !== 'disconnected' && !isVirtualMidiInput(input));
+  const ignoredInputs = inputs.filter((input) => input.state !== 'disconnected' && isVirtualMidiInput(input));
+  _midiConnected = pianoInputs.length > 0;
+
+  for (const input of ignoredInputs) {
+    input.onmidimessage = null;
+  }
+  for (const input of pianoInputs) {
     input.onmidimessage = ({ data }) => {
       const [status, pitch, velocity] = data;
       if ((status & 0xF0) === 0x90 && velocity > 0) handleMidiNote(pitch);
     };
   }
-  if (inputs.length === 0) {
-    setMidiBadge('midi-badge-disconnected', 'No piano detected');
+
+  if (pianoInputs.length === 0) {
+    const ignoredNames = ignoredInputs.map((input) => input.name || 'Virtual MIDI port').join(', ');
+    setMidiBadge(
+      'midi-badge-disconnected',
+      'No piano detected',
+      ignoredNames ? `Ignored virtual MIDI ports: ${ignoredNames}` : 'MIDI piano status'
+    );
   } else {
-    const name = inputs[0].name || 'MIDI device';
-    const extra = inputs.length > 1 ? ` (+${inputs.length - 1})` : '';
+    const name = pianoInputs[0].name || 'MIDI device';
+    const extra = pianoInputs.length > 1 ? ` (+${pianoInputs.length - 1})` : '';
     setMidiBadge('midi-badge-connected', `Piano connected: ${name}${extra}`);
   }
 }
@@ -3042,16 +3529,59 @@ function enableMidi() {
 }
 
 // ── Delete piece ─────────────────────────────────────────────────────────────
+function confirmDialog({ title = 'Are you sure?', message = '', confirmText = 'Delete', cancelText = 'Cancel', danger = true } = {}) {
+  return new Promise((resolve) => {
+    const modal = document.getElementById('confirm-modal');
+    const titleEl = document.getElementById('confirm-modal-title');
+    const msgEl = document.getElementById('confirm-modal-message');
+    const okBtn = document.getElementById('confirm-modal-ok');
+    const cancelBtn = document.getElementById('confirm-modal-cancel');
+    if (!modal || !okBtn || !cancelBtn) { resolve(window.confirm(message)); return; }
+    titleEl.textContent = title;
+    msgEl.textContent = message;
+    okBtn.textContent = confirmText;
+    cancelBtn.textContent = cancelText;
+    okBtn.classList.toggle('btn-danger', !!danger);
+    okBtn.classList.toggle('btn-primary', !danger);
+    modal.style.display = 'flex';
+
+    const cleanup = (result) => {
+      modal.style.display = 'none';
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      modal.removeEventListener('click', onBackdrop);
+      document.removeEventListener('keydown', onKey);
+      resolve(result);
+    };
+    const onOk = () => cleanup(true);
+    const onCancel = () => cleanup(false);
+    const onBackdrop = (ev) => { if (ev.target === modal) cleanup(false); };
+    const onKey = (ev) => {
+      if (ev.key === 'Escape') cleanup(false);
+      else if (ev.key === 'Enter') cleanup(true);
+    };
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    modal.addEventListener('click', onBackdrop);
+    document.addEventListener('keydown', onKey);
+    setTimeout(() => okBtn.focus(), 0);
+  });
+}
+
 async function deleteScore(e, name) {
   e.stopPropagation();
+  if (state.guestMode || isGuestScoreName(name)) {
+    showGuestUpgradeToast('Demo pieces are built in. Create a free account to manage your own library.');
+    return;
+  }
   if (_appConfig.auth_enabled) {
-    if (!confirm(`Delete "${formatName(name)}" from this account?`)) return;
+    if (!await confirmDialog({ title: 'Delete piece?', message: `Delete "${formatName(name)}" from this account? This cannot be undone.` })) return;
     await api(`/api/scores/${name}`, { method: 'DELETE' });
     localStorage.removeItem(`accompy_score_v2_${_authUser?.id || _authUser?.username || 'auth'}_${name}`);
     await loadScoreList();
     return;
   }
-  if (!confirm(`Remove "${formatName(name)}" from this browser's list?`)) return;
+  if (!await confirmDialog({ title: 'Remove piece?', message: `Remove "${formatName(name)}" from this browser's list?`, confirmText: 'Remove' })) return;
   removeScoreFromLibrary(name);
   await loadScoreList();
 }
@@ -3060,6 +3590,10 @@ async function deleteScore(e, name) {
 let _searchTimer = null;
 
 function openAddModal() {
+  if (state.guestMode) {
+    showGuestUpgradeToast('Create a free account to upload personal sheet music and keep it in your library.');
+    return;
+  }
   if (_appConfig.auth_enabled && !_authUser) {
     setAuthStatus('Sign in first to add pieces.', 'error');
     return;
@@ -3349,8 +3883,16 @@ initHorizontalSplitters();
 onNoiseGateChange(document.getElementById('noise-gate')?.value || '1');
 setLatencyCompensation(localStorage.getItem('accompy_latency_comp_ms') || '0');
 initAppConfig().then(async () => {
-  if (!_appConfig.auth_enabled || _authUser) {
-    await loadScoreList();
-    await openRouteFromLocation({ replace: true });
+  if (state.guestMode || !_appConfig.auth_enabled || _authUser) {
+    const hasRoute = !!routeScoreName();
+    if (hasRoute) {
+      await Promise.all([
+        loadScoreList(),
+        openRouteFromLocation({ replace: true }),
+      ]);
+    } else {
+      await loadScoreList();
+      await openRouteFromLocation({ replace: true });
+    }
   }
 });

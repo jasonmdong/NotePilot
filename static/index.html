@@ -42,15 +42,26 @@
         <div class="auth-actions">
           <button class="btn btn-primary" type="button" onclick="signIn()">Log in</button>
           <button class="btn btn-ghost" type="button" onclick="signUp()">Sign up</button>
+          <button class="btn btn-ghost guest-signin-btn" type="button" onclick="continueAsGuest()">Continue as Guest</button>
         </div>
         <div id="auth-status" class="auth-status">Loading sign-in…</div>
       </div>
     </div>
   </div>
+  <div id="guest-banner" class="guest-banner" style="display:none">
+    <div>
+      <strong>Guest Mode</strong>
+      <span>Changes are saved only on this device.</span>
+    </div>
+    <div class="guest-banner-actions">
+      <button class="btn btn-ghost" type="button" onclick="resetGuestDemo()">Reset Demo</button>
+      <button class="btn btn-primary" type="button" onclick="showCreateAccountPrompt('Create a free account to save your own pieces and progress.')">Create Account</button>
+    </div>
+  </div>
   <div class="library-header">
     <div>
-      <h2>Your Library</h2>
-      <p>Choose a piece, set your part, and let NotePilot follow your tempo.</p>
+      <h2 id="library-title">Your Library</h2>
+      <p id="library-subtitle">Choose a piece, set your part, and let NotePilot follow your tempo.</p>
     </div>
     <button id="add-piece-btn" class="btn btn-primary" onclick="openAddModal()">+ Add piece</button>
   </div>
@@ -110,6 +121,22 @@
   </div>
 </div>
 
+<!-- ── Confirm dialog ── -->
+<div id="confirm-modal" class="modal-backdrop" style="display:none">
+  <div class="modal confirm-modal">
+    <div class="modal-header">
+      <h3 id="confirm-modal-title">Are you sure?</h3>
+    </div>
+    <div class="modal-body">
+      <p id="confirm-modal-message" class="confirm-modal-message"></p>
+      <div class="confirm-modal-actions">
+        <button id="confirm-modal-cancel" class="btn btn-ghost" type="button">Cancel</button>
+        <button id="confirm-modal-ok" class="btn btn-danger" type="button">Delete</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ── Play screen ── -->
 <div id="play-screen" class="screen">
   <div class="play-shell">
@@ -127,12 +154,37 @@
         aria-label="Collapse piece sidebar">☰</button>
     </div>
     <div id="play-piece-list" class="play-piece-list"></div>
+    <div id="play-guest-banner" class="play-guest-banner" style="display:none">
+      <strong>Guest Mode</strong>
+      <span>Changes are saved only on this device.</span>
+      <div>
+        <button class="btn btn-ghost" type="button" onclick="resetGuestDemo()">Reset Demo</button>
+        <button class="btn btn-primary" type="button" onclick="showCreateAccountPrompt('Create a free account to save your own pieces and progress.')">Create Account</button>
+      </div>
+    </div>
     <div class="play-sidebar-footer">
       <button class="sidebar-brand-home" type="button" onclick="goHome()" aria-label="Return to home page">
         <span class="sidebar-brand-dot" aria-hidden="true">N</span>
         <span class="sidebar-brand-word">Note<span>Pilot</span></span>
       </button>
-      <button class="theme-toggle sidebar-theme-toggle" data-theme-toggle onclick="toggleTheme()" aria-label="Toggle light and dark mode">Light</button>
+      <div class="sidebar-footer-actions">
+        <button class="theme-toggle sidebar-theme-toggle" data-theme-toggle onclick="toggleTheme()" aria-label="Toggle light and dark mode">Light</button>
+        <div class="sidebar-account-menu">
+          <button
+            id="sidebar-account-btn"
+            class="sidebar-account-btn"
+            type="button"
+            onclick="toggleSidebarAccountMenu()"
+            aria-label="Open account menu"
+            aria-expanded="false">?</button>
+          <div id="sidebar-account-popover" class="sidebar-account-popover" style="display:none">
+            <span class="sidebar-account-eyebrow">Profile</span>
+            <strong id="sidebar-account-name">Not signed in</strong>
+            <span id="sidebar-account-detail">Sign in to save your library.</span>
+            <button id="sidebar-account-action" class="btn btn-ghost" type="button" onclick="sidebarAccountAction()">Sign in</button>
+          </div>
+        </div>
+      </div>
     </div>
   </aside>
 
@@ -233,7 +285,6 @@
         </div>
       </div>
       <div class="reference-keyboard-panel" id="full-keyboard-panel">
-        <div class="reference-keyboard-title">Full piano board</div>
         <div id="full-note-highway" class="full-note-highway">
           <div class="full-note-hit-line"></div>
         </div>
@@ -316,11 +367,21 @@
       </div>
     </section>
 
+    <section id="guest-tips-card" class="practice-card guest-tips-card" style="display:none">
+      <h4>Demo Tips</h4>
+      <ul id="guest-tips-list"></ul>
+      <div class="guest-annotation-actions">
+        <button class="btn btn-ghost" type="button" onclick="addGuestAnnotation('Practice this measure slowly')">Mark slow spot</button>
+        <button class="btn btn-ghost" type="button" onclick="addGuestAnnotation('Good run')">Mark good run</button>
+      </div>
+      <div id="guest-annotation-list" class="guest-annotation-list"></div>
+    </section>
+
     <section class="practice-card input-mode-section">
     <h4>Input method</h4>
     <div class="input-mode-tabs">
       <button class="mode-tab active" id="tab-keyboard" onclick="setInputMode('keyboard')">⌨ Keyboard</button>
-      <button class="mode-tab" id="tab-mic" onclick="setInputMode('mic')">🎙 Microphone</button>
+      <button class="mode-tab" id="tab-mic" onclick="setInputMode('mic')">🎙 Microphone <span class="beta-badge">Beta</span></button>
     </div>
 
     <div id="mic-controls" style="display:none">
@@ -369,6 +430,16 @@
   </div>
   </div>
 
+</div>
+
+<div id="upgrade-toast" class="upgrade-toast" style="display:none">
+  <button class="upgrade-toast-close" type="button" onclick="hideUpgradeToast()" aria-label="Dismiss">✕</button>
+  <strong>Create a free account</strong>
+  <p id="upgrade-toast-message">Save your own pieces and progress across devices.</p>
+  <div class="upgrade-toast-actions">
+    <button class="btn btn-primary" type="button" onclick="showCreateAccountPrompt('Create a free account to save your own pieces and progress.')">Create Account</button>
+    <button class="btn btn-ghost" type="button" onclick="hideUpgradeToast()">Keep exploring</button>
+  </div>
 </div>
 
 <script src="https://unpkg.com/tone@15.1.22/build/Tone.js"></script>
