@@ -22,6 +22,10 @@ def _score_row_to_payload(row: dict) -> dict:
             merged = [pitches, event[1], duration]
             if len(event) > 3:
                 merged.append(event[3])
+            if len(event) > 4:
+                if len(merged) == 3:
+                    merged.append(None)
+                merged.extend(event[4:])
             left_hand.append(merged)
     left_hand.sort(key=lambda event: event[1])
     sheet_html = row.get("sheet_html") or ""

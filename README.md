@@ -1,5 +1,5 @@
 ---
-title: accompy
+title: NotePilot
 emoji: 🎹
 colorFrom: blue
 colorTo: indigo
@@ -10,9 +10,9 @@ pinned: false
 
 # NotePilot
 
-A real-time accompanist (for now for piano ideally lol). Select right/left hand, then accompy tracks your tempo and accompanies automatically. Demo available [here](https://jasonmdong-accompy.hf.space/).
+A real-time accompanist and piano practice app. Select right/left hand, then NotePilot tracks your tempo and accompanies automatically. Demo available [here](https://jasonmdong-accompy.hf.space/).
 
-![Accompy demo](docs/images/demo_v2.png)
+![NotePilot demo](docs/images/demo_v2.png)
 
 ## Setup
 

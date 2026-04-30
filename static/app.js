@@ -42,6 +42,7 @@ const INSTRUMENT_EMOJI = {
 const TEMPO_PAUSE_IGNORE_SEC = 3;
 let _accompanimentLatencyCompSec = 0.28;
 const CHORD_MATCH_WINDOW_SEC = 0.5;
+const MIDI_DUPLICATE_NOTE_GUARD_MS = 18;
 
 // ── Playback engines ────────────────────────────────────────────────────────
 let _audioCtx = null;
@@ -220,8 +221,8 @@ function midiToToneNote(midi) {
 }
 
 function currentBps() {
-  if (state.tracker) return state.tracker.bps();
-  if (state.accompanist) return state.accompanist._bps;
+  if (state.playing && state.tracker) return state.tracker.bps();
+  if (state.playing && state.accompanist) return state.accompanist._bps;
   const bpm = parseFloat(document.getElementById('bpm-input')?.value) || 120;
   return bpm / 60;
 }
@@ -243,6 +244,33 @@ function eventDuration(event, fallbackBeats = 0.75) {
 function eventPedalRelease(event) {
   const raw = Number(event?.[3]);
   return Number.isFinite(raw) && raw > 0 ? raw : null;
+}
+
+function eventOrnament(event) {
+  return eventMetadata(event, 'tremolo');
+}
+
+function eventMetadata(event, type) {
+  if (!Array.isArray(event)) return null;
+  for (const item of event.slice(4)) {
+    if (item?.type === type) return item;
+    if (Array.isArray(item)) {
+      const match = item.find((entry) => entry?.type === type);
+      if (match) return match;
+    }
+  }
+  return null;
+}
+
+function eventDynamic(event) {
+  return eventMetadata(event, 'dynamic');
+}
+
+function eventVelocity(event, fallback = 0.5) {
+  const velocity = Number(eventDynamic(event)?.velocity);
+  return Number.isFinite(velocity)
+    ? Math.max(0.08, Math.min(1, velocity))
+    : fallback;
 }
 
 function isPedaledEvent(event) {
@@ -487,7 +515,9 @@ function playNote(midi, velocity = 0.6, instrument = 'piano', opts = {}) {
 }
 
 function playChord(pitches, velocity = 0.5, instrument = 'piano', opts = {}) {
-  pitches.forEach(p => playNote(p, velocity / pitches.length + 0.3, instrument, opts));
+  const chordSize = Math.max(1, pitches.length);
+  const noteVelocity = Math.min(1, Math.max(0.08, velocity / Math.sqrt(chordSize) + 0.08));
+  pitches.forEach(p => playNote(p, noteVelocity, instrument, opts));
   if (instrument === 'piano' && opts.pedaled) {
     playPedalResonance(pitches, velocity, opts);
   }
@@ -496,6 +526,62 @@ function playChord(pitches, velocity = 0.5, instrument = 'piano', opts = {}) {
 function eventPitches(event) {
   if (!event) return [];
   return Array.isArray(event[0]) ? event[0] : [event[0]];
+}
+
+function tremoloTargetSeconds(marks) {
+  const normalized = Math.max(1, Math.min(4, Number.parseInt(marks, 10) || 3));
+  return ({ 1: 0.18, 2: 0.125, 3: 0.085, 4: 0.065 })[normalized] || 0.085;
+}
+
+function expandedTremoloEvents(event, bps = currentBps()) {
+  const ornament = eventOrnament(event);
+  if (ornament?.type !== 'tremolo') return null;
+
+  const groups = Array.isArray(ornament.groups)
+    ? ornament.groups
+        .map((group) => Array.isArray(group) ? group.filter(Number.isFinite) : [])
+        .filter((group) => group.length)
+    : [];
+  if (!groups.length) return null;
+
+  const beat = Number(event?.[1]);
+  const durationBeats = eventDuration(event);
+  if (!Number.isFinite(beat) || durationBeats <= 0) return null;
+
+  const seconds = durationBeats / Math.max(0.35, bps);
+  const targetSeconds = tremoloTargetSeconds(ornament.marks);
+  const minimum = groups.length > 1 ? groups.length : 2;
+  const attackCount = Math.max(
+    minimum,
+    Math.min(128, Math.round(seconds / targetSeconds))
+  );
+  const intervalBeats = durationBeats / attackCount;
+  const pedalRelease = eventPedalRelease(event);
+  const dynamic = eventDynamic(event);
+
+  return Array.from({ length: attackCount }, (_, idx) => {
+    const group = groups[idx % groups.length];
+    const payload = group.length === 1 ? group[0] : group;
+    const expanded = [payload, beat + idx * intervalBeats, intervalBeats];
+    if (pedalRelease !== null) expanded.push(pedalRelease);
+    if (dynamic) {
+      if (expanded.length === 3) expanded.push(null);
+      expanded.push(dynamic);
+    }
+    return expanded;
+  });
+}
+
+function expandDynamicTremolos(events, bps = currentBps()) {
+  if (!Array.isArray(events)) return [];
+  const expanded = [];
+  events.forEach((event) => {
+    const tremoloEvents = expandedTremoloEvents(event, bps);
+    if (tremoloEvents) expanded.push(...tremoloEvents);
+    else expanded.push(event);
+  });
+  expanded.sort((a, b) => a[1] - b[1]);
+  return expanded;
 }
 
 function leadPitchFromEvent(event) {
@@ -693,7 +779,7 @@ class Accompanist {
           const instr = this._instruments[0] || 'piano';
           const duration = Math.max(0.12, (durationBeats ?? 0.75) / Math.max(0.5, this._bps));
           const pedalRelease = eventPedalRelease(this.events[this._lhIdx]);
-          playChord(pitches, 0.5, instr, {
+          playChord(pitches, eventVelocity(this.events[this._lhIdx]), instr, {
             duration,
             pedaled: pedalRelease !== null,
             pedalHold: pedalRelease !== null ? Math.max(duration, (pedalRelease - beat) / Math.max(0.5, this._bps)) : null,
@@ -715,6 +801,8 @@ let state = {
   fingeringJob:     null,
   tracker:          null,
   accompanist:      null,
+  practiceRightHand: null,
+  practiceLeftHand:  null,
   playing:          false,
   selectedPart:     0,
   partInstruments:  {},  // partIndex → instrument name override
@@ -792,6 +880,14 @@ function updateScoreUrl(name, replace = false) {
   const method = replace ? 'replaceState' : 'pushState';
   window.history[method]({ score: name || null }, '', nextPath);
 }
+
+function goHome() {
+  if (state.playing) stopPlaying();
+  updateScoreUrl(null);
+  showScreen('list-screen');
+}
+
+window.goHome = goHome;
 
 function applyPlaySidebarCollapsed(collapsed) {
   const shell = document.querySelector('#play-screen .play-shell');
@@ -1259,7 +1355,7 @@ function applyTheme(theme) {
   const normalized = theme === 'light' ? 'light' : 'dark';
   document.body.classList.toggle('light', normalized === 'light');
   const toggle = document.getElementById('theme-toggle');
-  if (toggle) toggle.textContent = normalized === 'light' ? '🌙' : '☀️';
+  if (toggle) toggle.textContent = normalized === 'light' ? 'Dark' : 'Light';
   localStorage.setItem('accompy_theme', normalized);
   document.querySelectorAll('#sheet-frame, .score-preview-frame').forEach((frame) => sanitizeSheetFrame(frame));
 }
@@ -1871,6 +1967,8 @@ async function openScore(name, options = {}) {
   const data = await fetchScore(name);
   state.current = data;
   state.finishedPlayback = false;
+  state.practiceRightHand = null;
+  state.practiceLeftHand = null;
   const parts = data.parts || [];
   state.selectedPart = parts.length
     ? Math.max(0, Math.min(previousPart, parts.length - 1))
@@ -1952,6 +2050,8 @@ window.addEventListener('popstate', () => {
 
 async function selectPart(idx) {
   state.selectedPart = idx;
+  state.practiceRightHand = null;
+  state.practiceLeftHand = null;
   document.querySelectorAll('.part-btn').forEach((b, i) =>
     b.classList.toggle('selected', i === idx));
   buildKeyboard(getRightHand());
@@ -1982,13 +2082,18 @@ async function changeInstrument(partIdx, instrument) {
   preloadCurrentScoreInstruments();
 }
 
-function getRightHand() {
+function getRightHandRaw() {
   const parts = state.current?.parts;
   if (parts && parts.length > 0) return parts[state.selectedPart ?? 0].notes;
   return state.current?.right_hand || [];
 }
 
-function getLeftHand() {
+function getRightHand() {
+  if (state.practiceRightHand) return state.practiceRightHand;
+  return expandDynamicTremolos(getRightHandRaw(), currentBps());
+}
+
+function getLeftHandRaw() {
   const parts = state.current?.parts;
   if (!parts || parts.length === 0) return state.current?.left_hand || [];
   const idx = state.selectedPart ?? 0;
@@ -2000,8 +2105,18 @@ function getLeftHand() {
     const merged = [eventPitches(event), event[1], eventDuration(event)];
     const pedalRelease = eventPedalRelease(event);
     if (pedalRelease !== null) merged.push(pedalRelease);
+    const metadata = Array.isArray(event) ? event.slice(4).filter((item) => item !== undefined && item !== null) : [];
+    if (metadata.length) {
+      if (merged.length === 3) merged.push(null);
+      merged.push(...metadata);
+    }
     return merged;
   });
+}
+
+function getLeftHand() {
+  if (state.practiceLeftHand) return state.practiceLeftHand;
+  return expandDynamicTremolos(getLeftHandRaw(), currentBps());
 }
 
 function initializeSheetHighlighting() {
@@ -2175,7 +2290,7 @@ function ensureNoteHighway() {
 const HIGHWAY_LOOK_BEHIND_BEATS = 0.5;
 const HIGHWAY_LOOK_AHEAD_BEATS = 4;
 const HIGHWAY_TOP_PADDING = 12;
-const HIGHWAY_MIN_BAR_HEIGHT = 3;
+const HIGHWAY_MIN_BAR_HEIGHT = 5;
 const HIGHWAY_BAR_GAP_BEATS = 0.06;
 
 function resolveSustainBeats(event, nextBeat) {
@@ -2193,8 +2308,9 @@ function computeBarGeometry(delta, sustainBeats, laneHeight, hitLineTop, pixelsP
   const topRaw = bottomRaw - sustainBeats * pixelsPerBeat;
   const top = Math.max(HIGHWAY_TOP_PADDING, topRaw);
   const bottom = Math.min(laneHeight, bottomRaw);
-  if (bottom - top < HIGHWAY_MIN_BAR_HEIGHT) return null;
-  return { top, height: bottom - top };
+  if (bottom <= HIGHWAY_TOP_PADDING || bottom <= top) return null;
+  const height = Math.min(bottom - HIGHWAY_TOP_PADDING, Math.max(HIGHWAY_MIN_BAR_HEIGHT, bottom - top));
+  return { top: Math.max(HIGHWAY_TOP_PADDING, bottom - height), height };
 }
 
 function renderNoteHighway() {
@@ -2424,8 +2540,10 @@ async function startPlaying() {
 
   const bpm        = parseFloat(document.getElementById('bpm-input').value) || 100;
   const initialBps = bpm / 60;
-  const right = getRightHand();
-  const left  = getLeftHand();
+  const right = expandDynamicTremolos(getRightHandRaw(), initialBps);
+  const left  = expandDynamicTremolos(getLeftHandRaw(), initialBps);
+  state.practiceRightHand = right;
+  state.practiceLeftHand = left;
 
   // Build per-part instrument map for the accompanist (all non-selected parts)
   const parts = state.current?.parts || [];
@@ -2546,6 +2664,8 @@ function stopPlaying(reason = 'stopped') {
   state.paused = false;
   state.pausedBeat = 0;
   state.finishedPlayback = finished;
+  state.practiceRightHand = null;
+  state.practiceLeftHand = null;
   _noteHighwayStartTime = null;
   const startBtn = document.getElementById('start-btn');
   const stopBtn = document.getElementById('stop-btn');
@@ -2589,7 +2709,7 @@ function handleNoteMic(midi) {
 function handleNote(midi) {
   if (!state.playing || state.paused || !state.tracker) return;
   const expectedEvent = getRightHand()[state.tracker.position] ?? getRightHand()[0];
-  playNote(midi, 0.6, getInstrumentForPart(state.selectedPart ?? 0), {
+  playNote(midi, expectedEvent ? eventVelocity(expectedEvent, 0.6) : 0.6, getInstrumentForPart(state.selectedPart ?? 0), {
     duration: expectedEvent ? eventDurationSeconds(expectedEvent, getInstrumentForPart(state.selectedPart ?? 0)) : undefined,
     pedaled: expectedEvent ? isPedaledEvent(expectedEvent) : false,
     pedalHold: expectedEvent ? eventPedalHoldSeconds(expectedEvent) : null,
@@ -2626,7 +2746,7 @@ function handleKeyboardInput(midiOrPitches) {
 function handleMidiNote(midi) {
   if (!state.playing || state.paused || !state.tracker) return;
   const now = performance.now();
-  if (_lastMidiPitch === midi && now - _lastMidiNoteTime < 70) return;
+  if (_lastMidiPitch === midi && now - _lastMidiNoteTime < MIDI_DUPLICATE_NOTE_GUARD_MS) return;
   _lastMidiPitch = midi;
   _lastMidiNoteTime = now;
   const keyId = cueKeyIdForMidi(midi);
@@ -2898,6 +3018,7 @@ function openAddModal() {
   document.getElementById('corpus-search').value = '';
   document.getElementById('import-name').value = '';
   document.getElementById('import-files').value = '';
+  updateImportFileLabel([]);
   setImportStatus('No files selected.');
   document.getElementById('search-results').innerHTML =
     '<p class="search-hint">Type to search the built-in music library (535 pieces).</p>';
@@ -2990,6 +3111,18 @@ function setImportStatus(message, tone = 'muted') {
       : 'var(--muted)';
 }
 
+function updateImportFileLabel(files) {
+  const label = document.getElementById('import-file-label');
+  if (!label) return;
+  if (!files.length) {
+    label.textContent = 'No files selected';
+    return;
+  }
+  label.textContent = files.length === 1
+    ? files[0].name
+    : `${files.length} files selected`;
+}
+
 async function runSearch() {
   const q = document.getElementById('corpus-search').value.trim();
   const spinner = document.getElementById('search-spinner');
@@ -3063,7 +3196,7 @@ async function importScoreFiles() {
   const files = [...(fileInput?.files || [])];
 
   if (!files.length) {
-    setImportStatus('Choose a MusicXML file, one PDF, or one/more page images first.', 'error');
+    setImportStatus('Choose a MusicXML/MuseScore file, one PDF, or one/more page images first.', 'error');
     return;
   }
 
@@ -3072,8 +3205,8 @@ async function importScoreFiles() {
   form.append('name', (nameInput?.value || '').trim());
 
   button.disabled = true;
-  const isDirectMusicXml = files.length === 1 && /\.(xml|mxl|musicxml)$/i.test(files[0].name || '');
-  setImportStatus(isDirectMusicXml ? 'Importing MusicXML and building the score…' : 'Running Audiveris and converting the score…');
+  const isDirectScore = files.length === 1 && /\.(xml|mxl|musicxml|mscx|mscz)$/i.test(files[0].name || '');
+  setImportStatus(isDirectScore ? 'Importing score file and building the score…' : 'Running Audiveris and converting the score…');
 
   try {
     const response = await fetch('/api/import', { method: 'POST', body: form });
@@ -3084,7 +3217,7 @@ async function importScoreFiles() {
     addScoreToLibrary(payload.name);
     setImportStatus(`Imported ${formatName(payload.name)}.`, 'success');
     await loadScoreList();
-    setTimeout(() => closeAddModal(), 350);
+    setTimeout(() => closeAddModal(), 3000);
   } catch (error) {
     setImportStatus(error.message || 'Import failed.', 'error');
   } finally {
@@ -3094,10 +3227,12 @@ async function importScoreFiles() {
 
 function initImportControls() {
   const importFiles = document.getElementById('import-files');
+  const dropzone = document.getElementById('import-dropzone');
   const importBtn = document.getElementById('import-btn');
 
   importFiles?.addEventListener('change', (event) => {
     const files = [...(event.target.files || [])];
+    updateImportFileLabel(files);
     if (!files.length) {
       setImportStatus('No files selected.');
       return;
@@ -3108,6 +3243,30 @@ function initImportControls() {
     setImportStatus(label);
   });
 
+  dropzone?.addEventListener('click', () => importFiles?.click());
+  dropzone?.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    importFiles?.click();
+  });
+  ['dragenter', 'dragover'].forEach((eventName) => {
+    dropzone?.addEventListener(eventName, (event) => {
+      event.preventDefault();
+      dropzone.classList.add('drag-over');
+    });
+  });
+  ['dragleave', 'drop'].forEach((eventName) => {
+    dropzone?.addEventListener(eventName, () => {
+      dropzone.classList.remove('drag-over');
+    });
+  });
+  dropzone?.addEventListener('drop', (event) => {
+    event.preventDefault();
+    if (!importFiles || !event.dataTransfer?.files?.length) return;
+    importFiles.files = event.dataTransfer.files;
+    importFiles.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+
   importBtn?.addEventListener('click', (event) => {
     event.preventDefault();
     importScoreFiles();
@@ -3116,9 +3275,24 @@ function initImportControls() {
 
 window.importScoreFiles = importScoreFiles;
 
+function initTempoControls() {
+  const input = document.getElementById('bpm-input');
+  if (!input || input.dataset.bound === '1') return;
+  input.dataset.bound = '1';
+  input.addEventListener('input', () => {
+    if (state.playing) return;
+    state.practiceRightHand = null;
+    state.practiceLeftHand = null;
+    buildKeyboard(getRightHand());
+    updateNextKey(getRightHand(), 0);
+    renderNoteHighway();
+  });
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 initLatencyControls();
 initImportControls();
+initTempoControls();
 initKeyboardLayoutToggle();
 initPlaySidebar();
 initHorizontalSplitters();

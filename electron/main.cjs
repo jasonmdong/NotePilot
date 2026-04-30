@@ -83,10 +83,10 @@ function startBackend() {
     });
 
     serverProcess.stdout.on('data', (chunk) => {
-      process.stdout.write(`[accompy-server] ${chunk}`);
+      process.stdout.write(`[notepilot-server] ${chunk}`);
     });
     serverProcess.stderr.on('data', (chunk) => {
-      process.stderr.write(`[accompy-server] ${chunk}`);
+      process.stderr.write(`[notepilot-server] ${chunk}`);
     });
 
     serverProcess.once('error', (error) => {
@@ -96,7 +96,7 @@ function startBackend() {
     serverProcess.once('exit', (code) => {
       if (!isQuitting && code !== 0) {
         dialog.showErrorBox(
-          'accompy backend stopped',
+          'NotePilot backend stopped',
           `The local Python server exited with code ${code}. Check the terminal logs for details.`
         );
       }
@@ -130,7 +130,7 @@ function waitForServer(timeoutMs = 20000) {
 
     const retry = () => {
       if (Date.now() - startedAt > timeoutMs) {
-        reject(new Error('Timed out waiting for the accompy backend to start.'));
+        reject(new Error('Timed out waiting for the NotePilot backend to start.'));
         return;
       }
       setTimeout(tryConnect, 300);
@@ -146,8 +146,8 @@ function createWindow() {
     height: 980,
     minWidth: 1100,
     minHeight: 760,
-    backgroundColor: '#0f0f13',
-    title: 'accompy',
+    backgroundColor: '#060b17',
+    title: 'NotePilot',
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -178,7 +178,7 @@ app.whenReady().then(async () => {
       ? `Backend startup failed.\n\nIf this is a packaged beta, rebuild the app bundle so it includes the backend binary.`
       : `Run one of these:\n  macOS: ./scripts/setup_desktop_mac.sh && ./scripts/run_desktop_mac.sh\n  Windows: powershell -ExecutionPolicy Bypass -File .\\scripts\\setup_desktop_windows.ps1\n           powershell -ExecutionPolicy Bypass -File .\\scripts\\run_desktop_windows.ps1\n\nIf Python is installed elsewhere, set PYTHON_PATH before launching.`;
     dialog.showErrorBox(
-      'accompy failed to start',
+      'NotePilot failed to start',
       `${error.message}\n\n${setupHelp}`
     );
     app.quit();

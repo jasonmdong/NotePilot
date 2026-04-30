@@ -73,6 +73,8 @@ STATIC_DIR = str(get_static_dir())
 ALLOWED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 ALLOWED_PDF_SUFFIXES = {".pdf"}
 ALLOWED_MUSICXML_SUFFIXES = {".xml", ".mxl", ".musicxml"}
+ALLOWED_MUSESCORE_SUFFIXES = {".mscx", ".mscz"}
+ALLOWED_DIRECT_SCORE_SUFFIXES = ALLOWED_MUSICXML_SUFFIXES | ALLOWED_MUSESCORE_SUFFIXES
 _score_store = create_score_store()
 SESSION_COOKIE_NAME = "accompy_session"
 SESSION_DAYS = 30
@@ -428,18 +430,18 @@ def combine_images_to_pdf(image_paths: list[Path], out_path: Path) -> Path:
 
 def prepare_omr_input(upload_paths: list[Path], work_dir: Path) -> Path:
     suffixes = {path.suffix.lower() for path in upload_paths}
-    if suffixes & ALLOWED_MUSICXML_SUFFIXES:
-        if len(upload_paths) != 1 or not suffixes <= ALLOWED_MUSICXML_SUFFIXES:
-            raise HTTPException(status_code=400, detail="Upload one MusicXML file, one PDF, or one/more image files.")
+    if suffixes & ALLOWED_DIRECT_SCORE_SUFFIXES:
+        if len(upload_paths) != 1 or not suffixes <= ALLOWED_DIRECT_SCORE_SUFFIXES:
+            raise HTTPException(status_code=400, detail="Upload one MusicXML/MuseScore file, one PDF, or one/more image files.")
         return upload_paths[0]
 
     if suffixes & ALLOWED_PDF_SUFFIXES:
         if len(upload_paths) != 1 or not suffixes <= ALLOWED_PDF_SUFFIXES:
-            raise HTTPException(status_code=400, detail="Upload one MusicXML file, one PDF, or one/more image files.")
+            raise HTTPException(status_code=400, detail="Upload one MusicXML/MuseScore file, one PDF, or one/more image files.")
         return upload_paths[0]
 
     if not suffixes or not suffixes <= ALLOWED_IMAGE_SUFFIXES:
-        raise HTTPException(status_code=400, detail="Supported uploads are MusicXML (.xml, .mxl, .musicxml), PDF, PNG, JPG, and JPEG.")
+        raise HTTPException(status_code=400, detail="Supported uploads are MusicXML (.xml, .mxl, .musicxml), MuseScore (.mscx, .mscz), PDF, PNG, JPG, and JPEG.")
 
     return combine_images_to_pdf(upload_paths, work_dir / "input.pdf")
 
@@ -765,7 +767,7 @@ async def import_score(
 
         upload_paths = [await save_uploaded_file(upload, uploads_dir, idx) for idx, upload in enumerate(files)]
         import_input = prepare_omr_input(upload_paths, work_dir)
-        if import_input.suffix.lower() in ALLOWED_MUSICXML_SUFFIXES:
+        if import_input.suffix.lower() in ALLOWED_DIRECT_SCORE_SUFFIXES:
             musicxml_path = import_input
         else:
             run_audiveris(import_input, output_dir)
@@ -774,7 +776,8 @@ async def import_score(
         try:
             result = convert_score_source(str(musicxml_path), name=score_name, out_dir=str(output_dir))
         except Exception as exc:
-            source_label = "uploaded MusicXML" if musicxml_path.suffix.lower() in ALLOWED_MUSICXML_SUFFIXES else "Audiveris output"
+            suffix = musicxml_path.suffix.lower()
+            source_label = "uploaded MusicXML/MuseScore file" if suffix in ALLOWED_DIRECT_SCORE_SUFFIXES else "Audiveris output"
             raise HTTPException(status_code=400, detail=f"Could not convert {source_label}: {exc}") from exc
 
         user_id = require_supabase_user_id(request, "score saving")

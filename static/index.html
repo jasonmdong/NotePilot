@@ -3,14 +3,21 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>accompy</title>
+  <title>NotePilot</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
 <header>
-  <h1>acc<span>ompy</span></h1>
-  <button id="theme-toggle" class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle light and dark mode" style="margin-left:auto">☀️</button>
+  <button class="brand-home" type="button" onclick="goHome()" aria-label="Return to home page">
+    <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true" focusable="false">
+      <circle class="brand-mark-ring" cx="25" cy="38" r="18"></circle>
+      <path class="brand-mark-note" d="M30 38.5a11 11 0 1 1-6.5-10V10.5c0-2 2.3-3.1 3.8-1.8l17 13.7c5 4 5.7 11.3 1.4 16.2l-2.5 2.8c1.2-5.6-.7-9.4-5.6-12.4l-8.1-5v14.5z"></path>
+      <path class="brand-mark-arrow" d="M13.5 39.3l20-8.3-8.3 20-3.9-8-7.8-3.7z"></path>
+    </svg>
+    <span class="brand-word">Note<span>Pilot</span></span>
+  </button>
+  <button id="theme-toggle" class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle light and dark mode" style="margin-left:auto">Light</button>
 </header>
 
 <!-- ── Score list ── -->
@@ -39,11 +46,21 @@
       </div>
     </div>
   </div>
-  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:.25rem">
-    <h2 style="font-size:1rem;color:#aaa">Choose a piece</h2>
+  <div class="library-header">
+    <div class="library-brand">
+      <svg class="library-brand-mark brand-mark" viewBox="0 0 64 64" aria-hidden="true" focusable="false">
+        <circle class="brand-mark-ring" cx="25" cy="38" r="18"></circle>
+        <path class="brand-mark-note" d="M30 38.5a11 11 0 1 1-6.5-10V10.5c0-2 2.3-3.1 3.8-1.8l17 13.7c5 4 5.7 11.3 1.4 16.2l-2.5 2.8c1.2-5.6-.7-9.4-5.6-12.4l-8.1-5v14.5z"></path>
+        <path class="brand-mark-arrow" d="M13.5 39.3l20-8.3-8.3 20-3.9-8-7.8-3.7z"></path>
+      </svg>
+      <div>
+        <h2>Note<span>Pilot</span></h2>
+        <p>Practice with purpose.</p>
+      </div>
+    </div>
     <button id="add-piece-btn" class="btn btn-primary" onclick="openAddModal()">+ Add piece</button>
   </div>
-  <p style="font-size:.85rem;color:#555;margin-bottom:.5rem">Select a line to play, and the accompaniment will follow you.</p>
+  <p class="library-subcopy">Select a line to play, and the accompaniment will follow you.</p>
   <div class="score-grid-toolbar">
     <label for="score-grid-columns">Preview columns</label>
     <select id="score-grid-columns" class="instr-select" onchange="setScoreGridColumns(this.value)">
@@ -81,11 +98,16 @@
 
       <div class="modal-section">
         <h4>Import PDF, images, or MusicXML</h4>
-        <p class="modal-copy">Upload one PDF, a set of page screenshots, or a MusicXML file. PDF/images go through Audiveris first; MusicXML imports directly.</p>
+        <p class="modal-copy">Upload one PDF, a set of page screenshots, or a MusicXML/MuseScore file. PDF/images go through Audiveris first; MusicXML and MuseScore files import directly.</p>
       </div>
       <div class="upload-form">
         <input id="import-name" type="text" placeholder="Piece name (optional)">
-        <input id="import-files" type="file" accept=".pdf,.png,.jpg,.jpeg,.xml,.mxl,.musicxml,image/png,image/jpeg,application/pdf,text/xml,application/xml" multiple>
+        <input id="import-files" class="file-input-hidden" type="file" accept=".pdf,.png,.jpg,.jpeg,.xml,.mxl,.musicxml,.mscx,.mscz,image/png,image/jpeg,application/pdf,text/xml,application/xml" multiple>
+        <div id="import-dropzone" class="file-dropzone" role="button" tabindex="0" aria-label="Choose files or drag files here">
+          <div class="file-dropzone-title">Choose files</div>
+          <div class="file-dropzone-copy">or drag PDF, image, MusicXML, or MuseScore files here</div>
+          <div id="import-file-label" class="file-dropzone-selection">No files selected</div>
+        </div>
         <div class="upload-actions">
           <button id="import-btn" type="button" class="btn btn-primary" onclick="importScoreFiles()">Import</button>
           <span id="import-status" class="import-status">No files selected.</span>

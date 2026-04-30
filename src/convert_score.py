@@ -4,6 +4,7 @@ Convert a MusicXML file into a score.py for accompy.
 Usage:
     python convert_score.py mysong.mxl
     python convert_score.py mysong.xml --out score.py
+    python convert_score.py mysong.mscx --out score.py
 
 The script expects:
   - Part 0 (first staff / treble): right-hand melody
@@ -16,9 +17,27 @@ import sys
 import os
 import re
 import argparse
-from music21 import converter, note, chord, expressions
+import shutil
+import subprocess
+import tempfile
+import zipfile
+import xml.etree.ElementTree as ET
+from music21 import converter, note, chord, expressions, pitch, dynamics as m21dynamics
 from src.fingering import build_fingering_state
 from src.paths import get_scores_dir
+
+MUSESCORE_SUFFIXES = {".mscx", ".mscz"}
+GRACE_NOTE_BEATS = 0.125
+DYNAMIC_VELOCITY = {
+    "ppp": 0.22,
+    "pp": 0.30,
+    "p": 0.38,
+    "mp": 0.48,
+    "mf": 0.60,
+    "f": 0.74,
+    "ff": 0.88,
+    "fff": 1.00,
+}
 
 
 def beat_to_float(beat) -> float:
@@ -71,6 +90,155 @@ def _note_tie_duration(part, start_note) -> float:
                 if later_tie.type == "stop":
                     return duration
     return duration
+
+
+def _dynamic_marks(container, anchor=None) -> list[tuple[float, str, float]]:
+    anchor = anchor or container
+    marks = []
+    for dynamic in container.recurse().getElementsByClass(m21dynamics.Dynamic):
+        value = str(getattr(dynamic, "value", "") or "").lower()
+        if value not in DYNAMIC_VELOCITY:
+            continue
+        try:
+            beat = float(dynamic.getOffsetInHierarchy(anchor))
+        except Exception:
+            beat = float(getattr(dynamic, "offset", 0.0) or 0.0)
+        marks.append((beat, value, DYNAMIC_VELOCITY[value]))
+    marks.sort(key=lambda item: item[0])
+    return marks
+
+
+def _dynamic_at_beat(dynamic_marks: list[tuple[float, str, float]], beat: float) -> dict | None:
+    active = None
+    for mark_beat, value, velocity in dynamic_marks:
+        if mark_beat <= beat + 0.0001:
+            active = (value, velocity)
+            continue
+        break
+    if active is None:
+        return None
+    value, velocity = active
+    return {"type": "dynamic", "mark": value, "velocity": velocity}
+
+
+def _tremolo_marks(number_of_marks) -> int:
+    try:
+        marks = int(number_of_marks)
+    except (TypeError, ValueError):
+        marks = 3
+    return max(1, min(4, marks))
+
+
+def _single_tremolo(el):
+    for expr in getattr(el, "expressions", []):
+        if isinstance(expr, expressions.Tremolo):
+            return expr
+    return None
+
+
+def _trill_expression(el):
+    for expr in getattr(el, "expressions", []):
+        if isinstance(expr, expressions.Trill):
+            return expr
+    return None
+
+
+def _is_grace(el) -> bool:
+    return bool(getattr(getattr(el, "duration", None), "isGrace", False))
+
+
+def _pitches_for_attack(el) -> list[int]:
+    if isinstance(el, note.Note):
+        return [el.pitch.midi] if _starts_new_attack(el) else []
+    if isinstance(el, chord.Chord):
+        return [n.pitch.midi for n in el.notes if _starts_new_attack(n)]
+    return []
+
+
+def _note_members(el):
+    if isinstance(el, note.Note):
+        return [el]
+    if isinstance(el, chord.Chord):
+        return list(el.notes)
+    return []
+
+
+def _attack_duration(part, el) -> float:
+    if isinstance(el, note.Note):
+        return _note_tie_duration(part, el)
+    if isinstance(el, chord.Chord):
+        attacked = [n for n in el.notes if _starts_new_attack(n)]
+        if not attacked:
+            return float(el.quarterLength)
+        return max(_note_tie_duration(part, n) for n in attacked)
+    return float(getattr(el, "quarterLength", 0.0) or 0.0)
+
+
+def _add_grouped_event(grouped: dict, beat: float, pitches: list[int], duration: float, ornament: dict | None = None):
+    if not pitches:
+        return
+    slot = grouped.setdefault(beat, {"pitches": [], "duration": 0.0, "ornaments": []})
+    slot["pitches"].extend(pitches)
+    slot["duration"] = max(slot["duration"], duration)
+    if ornament:
+        slot["ornaments"].append(ornament)
+
+
+def _iter_tremolo_attacks(start: float, end: float, interval: float, pitch_groups: list[list[int]]):
+    if not pitch_groups or end <= start:
+        return
+    interval = max(0.0625, interval)
+    beat = start
+    idx = 0
+    while beat < end - 0.0001:
+        yield beat, pitch_groups[idx % len(pitch_groups)], min(interval, end - beat)
+        beat += interval
+        idx += 1
+
+
+def _explicit_neighbor_accidental_midi(default_midi: int, flat_events: list, current_idx: int) -> int | None:
+    target = pitch.Pitch()
+    target.midi = default_midi
+    try:
+        source_measure = flat_events[current_idx].measureNumber
+    except Exception:
+        source_measure = None
+
+    def matches(candidate) -> bool:
+        if source_measure is not None and getattr(candidate, "measureNumber", None) != source_measure:
+            return False
+        return candidate.pitch.step == target.step and candidate.pitch.octave == target.octave
+
+    for candidate_el in flat_events[current_idx + 1:]:
+        for candidate in _note_members(candidate_el):
+            if matches(candidate) and candidate.pitch.accidental is not None:
+                return candidate.pitch.midi
+        if source_measure is not None and getattr(candidate_el, "measureNumber", None) != source_measure:
+            break
+
+    for candidate_el in reversed(flat_events[:current_idx]):
+        if source_measure is not None and getattr(candidate_el, "measureNumber", None) != source_measure:
+            break
+        for candidate in _note_members(candidate_el):
+            if matches(candidate) and candidate.pitch.accidental is not None:
+                return candidate.pitch.midi
+
+    return None
+
+
+def _trill_pitch_groups(el, trill, flat_events: list, current_idx: int) -> list[list[int]]:
+    pitches = _pitches_for_attack(el)
+    if not pitches:
+        return []
+    main_pitch = pitches[-1]
+    try:
+        trill.resolveOrnamentalPitches(el)
+        ornamental_pitch = trill.ornamentalPitch
+        neighbor_pitch = ornamental_pitch.midi if ornamental_pitch else main_pitch + 2
+    except Exception:
+        neighbor_pitch = main_pitch + 2
+    neighbor_pitch = _explicit_neighbor_accidental_midi(neighbor_pitch, flat_events, current_idx) or neighbor_pitch
+    return [[main_pitch], [neighbor_pitch]]
 
 
 def _pedal_spans(container, anchor=None) -> list[tuple[float, float]]:
@@ -142,21 +310,106 @@ def extract_events(part, pedal_spans: list[tuple[float, float]] | None = None) -
     piano writing does not collapse into short detached notes on playback.
     """
     grouped = {}
-    for el in part.flatten().notesAndRests:
+    dynamic_marks = _dynamic_marks(part)
+    flat_events = list(part.flatten().notesAndRests)
+    grace_counts_by_beat = {}
+    grace_index_by_id = {}
+    for event_idx, el in enumerate(flat_events):
+        if not isinstance(el, (note.Note, chord.Chord)) or not _is_grace(el):
+            continue
+        beat = beat_to_float(el.offset)
+        idx = grace_counts_by_beat.get(beat, 0)
+        grace_index_by_id[id(el)] = idx
+        grace_counts_by_beat[beat] = idx + 1
+
+    def playback_start(el) -> float:
+        beat = beat_to_float(el.offset)
+        if _is_grace(el):
+            return beat + grace_index_by_id.get(id(el), 0) * GRACE_NOTE_BEATS
+        return beat + grace_counts_by_beat.get(beat, 0) * GRACE_NOTE_BEATS
+
+    tremolo_spanner_by_first_id = {}
+    tremolo_spanner_element_ids = set()
+    for tremolo_spanner in part.recurse().getElementsByClass(expressions.TremoloSpanner):
+        spanned = [el for el in tremolo_spanner.getSpannedElements() if isinstance(el, (note.Note, chord.Chord))]
+        if len(spanned) < 2:
+            continue
+        tremolo_spanner_by_first_id[id(spanned[0])] = (tremolo_spanner, spanned)
+        tremolo_spanner_element_ids.update(id(el) for el in spanned)
+
+    for event_idx, el in enumerate(flat_events):
+        if _is_grace(el):
+            _add_grouped_event(
+                grouped,
+                playback_start(el),
+                _pitches_for_attack(el),
+                GRACE_NOTE_BEATS,
+            )
+            continue
+
+        spanner_info = tremolo_spanner_by_first_id.get(id(el))
+        if spanner_info:
+            tremolo_spanner, spanned = spanner_info
+            pitch_groups = [_pitches_for_attack(spanned_el) for spanned_el in spanned]
+            pitch_groups = [pitches for pitches in pitch_groups if pitches]
+            start = playback_start(spanned[0])
+            end = max(
+                beat_to_float(spanned_el.offset) + float(spanned_el.quarterLength)
+                for spanned_el in spanned
+            )
+            _add_grouped_event(
+                grouped,
+                start,
+                pitch_groups[0],
+                max(0.125, end - start),
+                {
+                    "type": "tremolo",
+                    "marks": _tremolo_marks(getattr(tremolo_spanner, "numberOfMarks", 3)),
+                    "groups": pitch_groups,
+                },
+            )
+            continue
+
+        if id(el) in tremolo_spanner_element_ids:
+            continue
+
+        trill = _trill_expression(el)
+        if trill:
+            start = playback_start(el)
+            end = beat_to_float(el.offset) + _attack_duration(part, el)
+            interval = max(0.0625, float(getattr(trill, "quarterLength", 0.125) or 0.125))
+            pitch_groups = _trill_pitch_groups(el, trill, flat_events, event_idx)
+            for beat, attack_pitches, duration in _iter_tremolo_attacks(start, end, interval, pitch_groups):
+                _add_grouped_event(grouped, beat, attack_pitches, duration)
+            continue
+
+        tremolo = _single_tremolo(el)
+        if tremolo:
+            pitches = _pitches_for_attack(el)
+            start = playback_start(el)
+            end = beat_to_float(el.offset) + _attack_duration(part, el)
+            _add_grouped_event(
+                grouped,
+                start,
+                pitches,
+                max(0.125, end - start),
+                {
+                    "type": "tremolo",
+                    "marks": _tremolo_marks(getattr(tremolo, "numberOfMarks", 3)),
+                    "groups": [pitches],
+                },
+            )
+            continue
+
         if isinstance(el, note.Note):
             if _starts_new_attack(el):
-                beat = beat_to_float(el.offset)
-                slot = grouped.setdefault(beat, {"pitches": [], "duration": 0.0})
-                slot["pitches"].append(el.pitch.midi)
-                slot["duration"] = max(slot["duration"], _note_tie_duration(part, el))
+                beat = playback_start(el)
+                _add_grouped_event(grouped, beat, [el.pitch.midi], _note_tie_duration(part, el))
         elif isinstance(el, chord.Chord):
-            attacked = [n for n in el.notes if _starts_new_attack(n)]
-            pitches = [n.pitch.midi for n in attacked]
+            pitches = _pitches_for_attack(el)
             if pitches:
-                beat = beat_to_float(el.offset)
-                slot = grouped.setdefault(beat, {"pitches": [], "duration": 0.0})
-                slot["pitches"].extend(pitches)
-                slot["duration"] = max(slot["duration"], max(_note_tie_duration(part, n) for n in attacked))
+                beat = playback_start(el)
+                _add_grouped_event(grouped, beat, pitches, _attack_duration(part, el))
 
     events = []
     for beat in sorted(grouped.keys()):
@@ -165,7 +418,16 @@ def extract_events(part, pedal_spans: list[tuple[float, float]] | None = None) -
         if not pitches:
             continue
         payload = pitches[0] if len(pitches) == 1 else pitches
-        events.append([payload, beat, duration])
+        event = [payload, beat, duration]
+        ornaments = grouped[beat].get("ornaments") or []
+        if ornaments:
+            event.extend([None, ornaments[0] if len(ornaments) == 1 else ornaments])
+        dynamic = _dynamic_at_beat(dynamic_marks, beat)
+        if dynamic:
+            if len(event) == 3:
+                event.append(None)
+            event.append(dynamic)
+        events.append(event)
 
     return _apply_pedal(events, pedal_spans if pedal_spans is not None else _pedal_spans(part))
 
@@ -201,6 +463,10 @@ def write_score_py(
             merged = [n[0] if isinstance(n[0], list) else [n[0]], n[1], n[2]]
             if len(n) > 3:
                 merged.append(n[3])
+            if len(n) > 4:
+                if len(merged) == 3:
+                    merged.append(None)
+                merged.extend(n[4:])
             left.append(merged)
     left.sort(key=lambda x: x[1])
 
@@ -209,7 +475,7 @@ def write_score_py(
         f'# Title: {title}',
         f'# Beat positions are in quarter-note units from the start.',
         f'',
-        f'# All parts — each note is [midi_pitch_or_chord, beat, duration, pedal_release?]',
+        f'# All parts — each note is [midi_pitch_or_chord, beat, duration, pedal_release?, ornament?]',
         f'PARTS = {parts_data!r}',
         f'MEASURE_BEATS = {(measure_beats or [])!r}',
         f'',
@@ -221,6 +487,10 @@ def write_score_py(
         f'        _merged = [n[0] if isinstance(n[0], list) else [n[0]], n[1], n[2]]',
         f'        if len(n) > 3:',
         f'            _merged.append(n[3])',
+        f'        if len(n) > 4:',
+        f'            if len(_merged) == 3:',
+        f'                _merged.append(None)',
+        f'            _merged.extend(n[4:])',
         f'        LEFT_HAND.append(_merged)',
         f'LEFT_HAND.sort(key=lambda x: x[1])',
     ]
@@ -263,32 +533,197 @@ def extract_measure_beats(score) -> list[float]:
     return [float(m.offset) for m in first_part.getElementsByClass('Measure')]
 
 
+def is_musescore_file(source: str) -> bool:
+    return os.path.splitext(source)[1].lower() in MUSESCORE_SUFFIXES
+
+
+def _find_musescore_binary() -> str | None:
+    configured = os.getenv("MUSESCORE_BIN") or os.getenv("MSCORE_BIN")
+    candidates = [
+        configured,
+        "mscore",
+        "musescore",
+        "MuseScore",
+        "mscore4",
+        "musescore4",
+        "/Applications/MuseScore 4.app/Contents/MacOS/mscore",
+        "/Applications/MuseScore 3.app/Contents/MacOS/mscore",
+        "/Applications/MuseScore.app/Contents/MacOS/mscore",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if os.path.sep in candidate:
+            if os.path.exists(candidate):
+                return candidate
+            continue
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return None
+
+
+def convert_musescore_to_musicxml(source: str, out_dir: str, score_name: str) -> str:
+    musescore_bin = _find_musescore_binary()
+    if not musescore_bin:
+        raise RuntimeError(
+            "MuseScore is required to import .mscx/.mscz files. Install MuseScore or set "
+            "MUSESCORE_BIN to the MuseScore executable."
+        )
+
+    out_path = os.path.join(out_dir, f"{score_name}__musescore.musicxml")
+    command = [musescore_bin, "-f", "-o", out_path, source]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("MuseScore timed out while converting the .mscx file.") from exc
+
+    if result.returncode != 0 or not os.path.exists(out_path):
+        details = "\n".join(
+            part.strip()
+            for part in [result.stderr, result.stdout]
+            if part and part.strip()
+        )
+        message = "MuseScore could not convert the .mscx file to MusicXML."
+        if details:
+            message = f"{message} {details}"
+        raise RuntimeError(message)
+
+    return out_path
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _remove_harmony_functions(xml_text: str) -> tuple[str, int]:
+    root = ET.fromstring(xml_text)
+    removed = 0
+    for parent in root.iter():
+        for child in list(parent):
+            if _xml_local_name(child.tag) != "harmony":
+                continue
+            has_function = any(
+                _xml_local_name(desc.tag) == "function" for desc in child.iter()
+            )
+            if has_function:
+                parent.remove(child)
+                removed += 1
+    return ET.tostring(root, encoding="unicode", xml_declaration=True), removed
+
+
+def _musicxml_rootfile_from_mxl(source: str) -> str:
+    with zipfile.ZipFile(source) as zf:
+        try:
+            container_text = zf.read("META-INF/container.xml")
+        except KeyError:
+            container_text = b""
+
+        if container_text:
+            container = ET.fromstring(container_text)
+            for el in container.iter():
+                if _xml_local_name(el.tag) == "rootfile":
+                    full_path = el.attrib.get("full-path")
+                    if full_path:
+                        return full_path
+
+        for name in zf.namelist():
+            if name.lower().endswith((".xml", ".musicxml")) and not name.startswith("META-INF/"):
+                return name
+
+    raise ValueError("Could not find a MusicXML score inside the uploaded MXL file.")
+
+
+def _read_musicxml_text(source: str) -> str:
+    if zipfile.is_zipfile(source):
+        rootfile = _musicxml_rootfile_from_mxl(source)
+        with zipfile.ZipFile(source) as zf:
+            return zf.read(rootfile).decode("utf-8-sig")
+
+    with open(source, encoding="utf-8-sig") as f:
+        return f.read()
+
+
+def _write_musicxml_without_harmony_functions(source: str, output_path: str) -> int:
+    xml_text = _read_musicxml_text(source)
+    sanitized_xml, removed_count = _remove_harmony_functions(xml_text)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(sanitized_xml)
+    return removed_count
+
+
+def _parse_uploaded_musicxml(source: str, fallback_musicxml_path: str | None = None):
+    try:
+        return converter.parse(source), source, False
+    except Exception as exc:
+        if "not a valid pitch specification" not in str(exc):
+            raise
+
+        temp_dir = None
+        sanitized_path = fallback_musicxml_path
+        if sanitized_path is None:
+            temp_dir = tempfile.TemporaryDirectory(prefix="accompy_musicxml_")
+            sanitized_path = os.path.join(temp_dir.name, "score_without_harmony_functions.musicxml")
+
+        try:
+            removed_count = _write_musicxml_without_harmony_functions(source, sanitized_path)
+            if removed_count == 0:
+                if temp_dir is not None:
+                    temp_dir.cleanup()
+                raise exc
+            score = converter.parse(sanitized_path)
+        except Exception:
+            if temp_dir is not None:
+                temp_dir.cleanup()
+            raise exc
+
+        render_source = sanitized_path if fallback_musicxml_path else source
+        if temp_dir is not None:
+            temp_dir.cleanup()
+        return score, render_source, True
+
+
 def convert_score_source(source: str, *, name: str | None = None, out_dir: str | None = None):
+    out_dir = out_dir or str(get_scores_dir())
+    title_fallback = humanize_score_title(source)
+    score_name = slugify_score_name(name or title_fallback)
+
     if source.startswith("corpus:"):
         from music21 import corpus as m21corpus
         corpus_path = source[len("corpus:"):]
         mxl_path = str(m21corpus.getWork(corpus_path))
         score = m21corpus.parse(corpus_path)
-        title_fallback = humanize_score_title(source)
         render_source_path = mxl_path
+        used_parse_fallback = False
     else:
-        mxl_path = source
-        score = converter.parse(source)
-        title_fallback = humanize_score_title(source)
-        render_source_path = mxl_path
+        mxl_path = (
+            convert_musescore_to_musicxml(source, out_dir, score_name)
+            if is_musescore_file(source)
+            else source
+        )
+        fallback_musicxml_path = os.path.join(out_dir, f"{score_name}__sanitized.musicxml")
+        score, render_source_path, used_parse_fallback = _parse_uploaded_musicxml(
+            mxl_path,
+            fallback_musicxml_path=fallback_musicxml_path,
+        )
 
     parts_data = build_parts_data(score)
     measure_beats = extract_measure_beats(score)
     title = score.metadata.title if score.metadata and score.metadata.title else title_fallback
-    score_name = slugify_score_name(name or title_fallback)
-    out_dir = out_dir or str(get_scores_dir())
     out_py = os.path.join(out_dir, f"{score_name}.py")
     out_html = os.path.join(out_dir, f"{score_name}.html")
 
     # Normalize uploaded MusicXML through music21 before sending it to Verovio.
     # Some raw .xml inputs parse fine in music21 but render poorly or blank in
     # Verovio until they are re-exported into canonical MusicXML.
-    if not source.startswith("corpus:"):
+    if not source.startswith("corpus:") and not used_parse_fallback:
         normalized_musicxml = os.path.join(out_dir, f"{score_name}__normalized.musicxml")
         try:
             render_source_path = score.write("musicxml", fp=normalized_musicxml)
@@ -365,7 +800,7 @@ def _detect_instrument(part) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Convert MusicXML to an accompy score")
-    parser.add_argument("input", help="Path to .mxl/.xml file, or corpus:<path>")
+    parser.add_argument("input", help="Path to .mxl/.xml/.mscx file, or corpus:<path>")
     parser.add_argument("--name", help="Score name (default: auto-derived from input)")
     parser.add_argument("--out", help="Explicit output path (overrides --name and default scores folder)")
     args = parser.parse_args()
