@@ -23,10 +23,11 @@ import time
 from pathlib import Path
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 import requests
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Response
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel
 from src.env import load_local_env
@@ -103,6 +104,33 @@ def verify_password(password: str, stored: str) -> bool:
 
 def create_session_token() -> str:
     return secrets.token_urlsafe(48)
+
+
+def set_app_session_cookie(response: Response, session_token: str):
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_token,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        max_age=SESSION_DAYS * 24 * 60 * 60,
+        expires=SESSION_DAYS * 24 * 60 * 60,
+        path="/",
+    )
+
+
+def create_app_session_response(response: Response, user: dict) -> dict:
+    session_token = create_session_token()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
+    _score_store.create_app_session(
+        user["id"],
+        hashlib.sha256(session_token.encode("utf-8")).hexdigest(),
+        expires_at.isoformat(),
+    )
+    public_user = {"id": user["id"], "username": user["username"]}
+    _cache_app_user(session_token, public_user)
+    set_app_session_cookie(response, session_token)
+    return {"ok": True, "user": public_user}
 
 
 def _get_cached_app_user(raw_token: str) -> dict | None:
@@ -515,12 +543,21 @@ def get_config():
     return {
         "supabase_enabled": isinstance(_score_store, SupabaseScoreStore),
         "auth_enabled": isinstance(_score_store, SupabaseScoreStore),
+        "google_auth_enabled": bool(
+            isinstance(_score_store, SupabaseScoreStore)
+            and os.getenv("SUPABASE_URL", "").strip()
+            and os.getenv("SUPABASE_ANON_KEY", "").strip()
+        ),
     }
 
 
 class SimpleAuthRequest(BaseModel):
     username: str
     password: str
+
+
+class SupabaseTokenRequest(BaseModel):
+    access_token: str
 
 
 @app.get("/api/session")
@@ -551,21 +588,7 @@ def signup(req: SimpleAuthRequest, response: Response):
     created = _score_store.create_app_user(username, hash_password(password))
     if not created:
         raise HTTPException(status_code=500, detail="Could not create user.")
-    session_token = create_session_token()
-    expires_at = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
-    _score_store.create_app_session(created["id"], hashlib.sha256(session_token.encode("utf-8")).hexdigest(), expires_at.isoformat())
-    _cache_app_user(session_token, {"id": created["id"], "username": created["username"]})
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=session_token,
-        httponly=True,
-        samesite="lax",
-        secure=False,
-        max_age=SESSION_DAYS * 24 * 60 * 60,
-        expires=SESSION_DAYS * 24 * 60 * 60,
-        path="/",
-    )
-    return {"ok": True, "user": {"id": created["id"], "username": created["username"]}}
+    return create_app_session_response(response, created)
 
 
 @app.post("/api/login")
@@ -577,21 +600,77 @@ def login(req: SimpleAuthRequest, response: Response):
     user = _score_store.get_app_user_by_username(username)
     if not user or not verify_password(password, user.get("password_hash") or ""):
         raise HTTPException(status_code=401, detail="Invalid username or password.")
-    session_token = create_session_token()
-    expires_at = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
-    _score_store.create_app_session(user["id"], hashlib.sha256(session_token.encode("utf-8")).hexdigest(), expires_at.isoformat())
-    _cache_app_user(session_token, {"id": user["id"], "username": user["username"]})
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=session_token,
-        httponly=True,
-        samesite="lax",
-        secure=False,
-        max_age=SESSION_DAYS * 24 * 60 * 60,
-        expires=SESSION_DAYS * 24 * 60 * 60,
-        path="/",
+    return create_app_session_response(response, user)
+
+
+@app.get("/api/auth/google/start")
+def start_google_auth(request: Request):
+    if not isinstance(_score_store, SupabaseScoreStore):
+        raise HTTPException(status_code=400, detail="Google sign-in requires Supabase-backed storage.")
+    supabase_url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+    anon_key = os.getenv("SUPABASE_ANON_KEY", "").strip()
+    if not (supabase_url and anon_key):
+        raise HTTPException(status_code=400, detail="Google sign-in requires SUPABASE_URL and SUPABASE_ANON_KEY.")
+
+    configured_origin = os.getenv("APP_PUBLIC_URL", "").strip().rstrip("/")
+    if configured_origin:
+        origin = configured_origin
+    else:
+        origin = str(request.base_url).rstrip("/")
+        forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
+        forwarded_host = request.headers.get("x-forwarded-host", "").split(",", 1)[0].strip()
+        if forwarded_proto and forwarded_host:
+            origin = f"{forwarded_proto}://{forwarded_host}"
+    redirect_to = f"{origin}/auth/callback"
+    auth_url = (
+        f"{supabase_url}/auth/v1/authorize"
+        f"?provider=google"
+        f"&redirect_to={quote(redirect_to, safe='')}"
     )
-    return {"ok": True, "user": {"id": user["id"], "username": user["username"]}}
+    return RedirectResponse(auth_url, status_code=302)
+
+
+@app.post("/api/auth/supabase-token")
+def login_with_supabase_token(req: SupabaseTokenRequest, response: Response):
+    if not isinstance(_score_store, SupabaseScoreStore):
+        raise HTTPException(status_code=400, detail="Google sign-in requires Supabase-backed storage.")
+    supabase_url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+    anon_key = os.getenv("SUPABASE_ANON_KEY", "").strip()
+    access_token = req.access_token.strip()
+    if not (supabase_url and anon_key and access_token):
+        raise HTTPException(status_code=400, detail="Missing Google sign-in token.")
+
+    auth_response = requests.get(
+        f"{supabase_url}/auth/v1/user",
+        headers={
+            "apikey": anon_key,
+            "Authorization": f"Bearer {access_token}",
+        },
+        timeout=15,
+    )
+    if auth_response.status_code != 200:
+        raise HTTPException(status_code=401, detail="Google sign-in token was not accepted.")
+
+    supabase_user = auth_response.json()
+    app_metadata = supabase_user.get("app_metadata") or {}
+    user_metadata = supabase_user.get("user_metadata") or {}
+    provider = app_metadata.get("provider")
+    providers = app_metadata.get("providers") or []
+    issuer = str(user_metadata.get("iss") or "")
+    if provider != "google" and "google" not in providers and "accounts.google.com" not in issuer:
+        raise HTTPException(status_code=400, detail="This sign-in token is not from Google.")
+
+    supabase_id = str(supabase_user.get("id") or "").replace("-", "")
+    if not supabase_id:
+        raise HTTPException(status_code=400, detail="Google sign-in did not return a user id.")
+    email = str(supabase_user.get("email") or user_metadata.get("email") or "").strip().lower()
+    username = email or f"google_{supabase_id[:24]}"
+    user = _score_store.get_app_user_by_username(username)
+    if not user:
+        user = _score_store.create_app_user(username, hash_password(secrets.token_urlsafe(32)))
+    if not user:
+        raise HTTPException(status_code=500, detail="Could not create Google user.")
+    return create_app_session_response(response, user)
 
 
 @app.post("/api/logout")

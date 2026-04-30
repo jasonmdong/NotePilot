@@ -862,11 +862,14 @@ function readApiErrorMessage(error) {
 function showScreen(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
+  document.body.classList.toggle('practice-mode', id === 'play-screen');
+  const header = document.getElementById('app-header');
+  if (header) header.hidden = id === 'play-screen';
 }
 
 function routeScoreName() {
   const raw = window.location.pathname.replace(/^\/+|\/+$/g, '');
-  if (!raw || raw.startsWith('api/')) return null;
+  if (!raw || raw.startsWith('api/') || raw === 'auth/callback') return null;
   try {
     return decodeURIComponent(raw);
   } catch {
@@ -923,33 +926,69 @@ function setAuthStatus(message, tone = 'muted') {
 function updateAuthUI() {
   const panel = document.getElementById('auth-panel');
   const loggedOut = document.getElementById('auth-logged-out');
-  const loggedIn = document.getElementById('auth-logged-in');
   const addPieceBtn = document.getElementById('add-piece-btn');
-  if (!panel || !loggedOut || !loggedIn || !addPieceBtn) return;
+  const navAuthUser = document.getElementById('nav-auth-user');
+  const navUsername = document.getElementById('nav-auth-username');
+  const googleBtn = document.getElementById('google-signin-btn');
+  const googleDivider = document.getElementById('google-auth-divider');
+  if (!panel || !loggedOut || !addPieceBtn) return;
   if (!_appConfig.auth_enabled) {
+    document.body.classList.remove('auth-mode');
     panel.style.display = 'none';
+    if (navAuthUser) navAuthUser.style.display = 'none';
     addPieceBtn.disabled = false;
     return;
   }
 
-  panel.style.display = 'block';
   const isLoggedIn = !!_authUser;
+  document.body.classList.toggle('auth-mode', !isLoggedIn);
+  panel.style.display = isLoggedIn ? 'none' : 'block';
   loggedOut.style.display = isLoggedIn ? 'none' : 'block';
-  loggedIn.style.display = isLoggedIn ? 'block' : 'none';
+  if (googleBtn) googleBtn.style.display = _appConfig.google_auth_enabled ? 'inline-flex' : 'none';
+  if (googleDivider) googleDivider.style.display = _appConfig.google_auth_enabled ? 'flex' : 'none';
   addPieceBtn.disabled = !isLoggedIn;
+  if (navAuthUser) navAuthUser.style.display = isLoggedIn ? 'flex' : 'none';
   if (isLoggedIn) {
-    document.getElementById('auth-user-email').textContent = _authUser.email || _authUser.username || 'Signed in';
+    if (navUsername) navUsername.textContent = _authUser.email || _authUser.username || 'Signed in';
     setAuthStatus('');
   } else {
+    if (navUsername) navUsername.textContent = '';
     document.getElementById('score-grid').innerHTML = '<div class="score-preview-empty">Sign in to load your score library.</div>';
   }
   renderPlayPieceList();
+}
+
+async function completeGoogleRedirectIfNeeded() {
+  const params = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  const query = new URLSearchParams(window.location.search);
+  const oauthError = params.get('error_description') || query.get('error_description') || params.get('error') || query.get('error');
+  if (oauthError) {
+    window.history.replaceState({ score: null }, '', '/');
+    setAuthStatus(`Google sign-in failed: ${oauthError}`, 'error');
+    return;
+  }
+  const accessToken = params.get('access_token');
+  if (!accessToken) return;
+  setAuthStatus('Finishing Google sign-in...');
+  try {
+    const result = await api('/api/auth/supabase-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ access_token: accessToken }),
+    });
+    _authUser = result.user || null;
+    window.history.replaceState({ score: null }, '', '/');
+  } catch (error) {
+    window.history.replaceState({ score: null }, '', '/');
+    setAuthStatus(error.message || 'Google sign-in failed.', 'error');
+  }
 }
 
 async function initAppConfig() {
   try {
     _appConfig = await api('/api/config');
     if (_appConfig.auth_enabled) {
+      await completeGoogleRedirectIfNeeded();
       const session = await api('/api/session');
       _authUser = session.user || null;
     }
@@ -1004,6 +1043,15 @@ async function signUp() {
   }
 }
 
+function signInWithGoogle() {
+  if (!_appConfig.google_auth_enabled) {
+    setAuthStatus('Google sign-in is not configured.', 'error');
+    return;
+  }
+  setAuthStatus('Redirecting to Google...');
+  window.location.href = '/api/auth/google/start';
+}
+
 async function signOut() {
   if (state.playing) stopPlaying();
   clearFingeringJobPolling();
@@ -1023,6 +1071,7 @@ async function signOut() {
 
 window.signIn = signIn;
 window.signUp = signUp;
+window.signInWithGoogle = signInWithGoogle;
 window.signOut = signOut;
 
 function loadPersonalScoreLibrary() {
@@ -1354,8 +1403,9 @@ function initLatencyControls() {
 function applyTheme(theme) {
   const normalized = theme === 'light' ? 'light' : 'dark';
   document.body.classList.toggle('light', normalized === 'light');
-  const toggle = document.getElementById('theme-toggle');
-  if (toggle) toggle.textContent = normalized === 'light' ? 'Dark' : 'Light';
+  document.querySelectorAll('[data-theme-toggle]').forEach((toggle) => {
+    toggle.textContent = normalized === 'light' ? 'Dark' : 'Light';
+  });
   localStorage.setItem('accompy_theme', normalized);
   document.querySelectorAll('#sheet-frame, .score-preview-frame').forEach((frame) => sanitizeSheetFrame(frame));
 }
