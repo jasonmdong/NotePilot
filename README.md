@@ -12,7 +12,7 @@ pinned: false
 
 A real-time accompanist and piano practice app. Select right/left hand, then NotePilot tracks your tempo and accompanies automatically. Demo available [here](https://jasonmdong-accompy.hf.space/).
 
-![NotePilot demo](docs/images/demo_v2.png)
+![NotePilot demo](docs/images/demo_v3.png)
 
 ## Setup
 
