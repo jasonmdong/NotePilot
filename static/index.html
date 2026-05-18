@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>NotePilot</title>
-  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/style.css?v=20260518-parts-text">
 </head>
 <body>
 
@@ -155,7 +155,6 @@
     <div class="play-sidebar-header">
       <div class="play-sidebar-copy">
         <h3>Pieces</h3>
-        <p>Switch pieces without returning to the gallery.</p>
       </div>
       <button
         id="play-sidebar-toggle"
@@ -347,12 +346,12 @@
         <span id="latency-value">0 ms</span>
       </div>
       <div id="part-picker" class="part-picker" style="display:none">
-        <h5>Your part</h5>
+        <h5>Your part(s)</h5>
         <div id="part-buttons" class="part-buttons"></div>
       </div>
       <div class="accompaniment-row">
         <span>Accompaniment</span>
-        <strong>Other parts</strong>
+        <strong id="accompaniment-summary">Other parts</strong>
       </div>
     </section>
 
@@ -394,8 +393,8 @@
     <section class="practice-card input-mode-section">
     <h4>Input method</h4>
     <div class="input-mode-tabs">
-      <button class="mode-tab active" id="tab-keyboard" onclick="setInputMode('keyboard')">⌨ Keyboard</button>
-      <button class="mode-tab" id="tab-mic" onclick="setInputMode('mic')">🎙 Microphone <span class="beta-badge">Beta</span></button>
+      <button class="mode-tab active" id="tab-keyboard" onclick="setInputMode('keyboard')">Keyboard</button>
+      <button class="mode-tab" id="tab-mic" onclick="setInputMode('mic')">Microphone <span class="beta-badge">Beta</span></button>
     </div>
 
     <div id="mic-controls" style="display:none">
@@ -459,6 +458,6 @@
 <script src="https://unpkg.com/tone@15.1.22/build/Tone.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.9.2/build/opensheetmusicdisplay.min.js"></script>
 <script src="/pitch.js"></script>
-<script src="/app.js"></script>
+<script src="/app.js?v=20260518-parts-text"></script>
 </body>
 </html>

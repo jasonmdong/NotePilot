@@ -49,10 +49,6 @@ const INSTRUMENTS = [
   'trumpet',
   'voice',
 ];
-const INSTRUMENT_EMOJI = {
-  piano:'🎹', violin:'🎻', viola:'🎻', cello:'🎻', contrabass:'🎻', strings:'🎻',
-  flute:'🪈', clarinet:'🎷', oboe:'🎷', bassoon:'🎷', horn:'📯', trumpet:'🎺', voice:'🎤',
-};
 const TEMPO_PAUSE_IGNORE_SEC = 3;
 let _accompanimentLatencyCompSec = 0.28;
 const CHORD_MATCH_WINDOW_SEC = 0.5;
@@ -758,6 +754,7 @@ let state = {
   practiceLeftHand:  null,
   playing:          false,
   selectedPart:     0,
+  selectedParts:    [0],
   partInstruments:  {},  // partIndex → instrument name override
   scoreGridColumns: 3,
   keyboardLayoutMode: 'full',
@@ -1455,9 +1452,119 @@ function saveCurrentScorePreferences(extra = {}) {
     inputMode: _inputMode,
     keyboardLayoutMode: state.keyboardLayoutMode,
     selectedPart: state.selectedPart ?? 0,
+    selectedParts: selectedPartIndices(),
     partInstruments: { ...(state.partInstruments || {}) },
     ...extra,
   });
+}
+
+function selectedPartIndices() {
+  const parts = state.current?.parts || [];
+  const max = Math.max(0, parts.length - 1);
+  const raw = Array.isArray(state.selectedParts) && state.selectedParts.length
+    ? state.selectedParts
+    : [state.selectedPart ?? 0];
+  const indices = [...new Set(raw
+    .map((idx) => Number.parseInt(idx, 10))
+    .filter((idx) => Number.isInteger(idx) && idx >= 0 && (!parts.length || idx <= max))
+  )].sort((a, b) => a - b);
+  return indices.length ? indices : [0];
+}
+
+function setSelectedPartIndices(indices) {
+  const parts = state.current?.parts || [];
+  const max = Math.max(0, parts.length - 1);
+  const normalized = [...new Set((indices || [])
+    .map((idx) => Number.parseInt(idx, 10))
+    .filter((idx) => Number.isInteger(idx) && idx >= 0 && (!parts.length || idx <= max))
+  )].sort((a, b) => a - b);
+  state.selectedParts = normalized.length ? normalized : [0];
+  state.selectedPart = state.selectedParts[0] ?? 0;
+}
+
+function defaultSelectedPartsForScore(score, prefs = {}) {
+  const parts = score?.parts || [];
+  if (!parts.length) return [0];
+
+  if (Array.isArray(prefs.selectedParts) && prefs.selectedParts.length) {
+    return prefs.selectedParts;
+  }
+
+  const title = `${score.title || ''} ${score.name || ''}`.toLowerCase();
+  if (title.includes('piano concerto')) {
+    const pianoParts = parts
+      .map((part, idx) => ({ part, idx }))
+      .filter(({ part }) => String(part.instrument || part.name || '').toLowerCase().includes('piano'))
+      .map(({ idx }) => idx);
+    if (pianoParts.length) return pianoParts;
+  }
+
+  if (Number.isInteger(prefs.selectedPart)) {
+    return [prefs.selectedPart];
+  }
+
+  return [0];
+}
+
+function mergePracticeEventsFromParts(partIndices) {
+  const parts = state.current?.parts;
+  if (!parts || !parts.length) return state.current?.right_hand || [];
+  const grouped = new Map();
+
+  partIndices.forEach((partIdx) => {
+    const part = parts[partIdx];
+    (part?.notes || []).forEach((event) => {
+      const beat = Number(event?.[1]);
+      if (!Number.isFinite(beat)) return;
+      const key = beat.toFixed(6);
+      const pitches = eventPitches(event);
+      if (!pitches.length) return;
+      const duration = eventDuration(event);
+      const existing = grouped.get(key) || {
+        pitches: [],
+        beat,
+        duration: 0,
+        pedalRelease: null,
+        metadata: [],
+      };
+      existing.pitches.push(...pitches);
+      existing.duration = Math.max(existing.duration, duration);
+      const pedalRelease = eventPedalRelease(event);
+      if (pedalRelease !== null) {
+        existing.pedalRelease = Math.max(existing.pedalRelease ?? pedalRelease, pedalRelease);
+      }
+      if (Array.isArray(event)) {
+        existing.metadata.push(...event.slice(4).filter((item) => item !== undefined && item !== null));
+      }
+      grouped.set(key, existing);
+    });
+  });
+
+  return [...grouped.values()]
+    .sort((a, b) => a.beat - b.beat)
+    .map((entry) => {
+      const pitches = [...new Set(entry.pitches)].sort((a, b) => a - b);
+      const merged = [pitches.length === 1 ? pitches[0] : pitches, entry.beat, entry.duration || 0.75];
+      if (entry.pedalRelease !== null) merged.push(entry.pedalRelease);
+      entry.metadata.forEach((item) => appendEventMetadata(merged, item));
+      return merged;
+    });
+}
+
+function updatePartSelectionUI() {
+  const selected = new Set(selectedPartIndices());
+  document.querySelectorAll('.part-btn').forEach((button) => {
+    const idx = Number.parseInt(button.dataset.partIndex || '-1', 10);
+    const isSelected = selected.has(idx);
+    button.classList.toggle('selected', isSelected);
+    button.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
+  });
+  const summary = document.getElementById('accompaniment-summary');
+  if (summary) {
+    const parts = state.current?.parts || [];
+    const accompanimentCount = Math.max(0, parts.length - selected.size);
+    summary.textContent = accompanimentCount === 1 ? '1 other part' : `${accompanimentCount} other parts`;
+  }
 }
 
 function normalizedScoreGridColumns(value) {
@@ -2550,7 +2657,7 @@ async function openScore(name, options = {}) {
   let loaded = false;
 
   try {
-    const previousPart = preserveSelectedPart ? (state.selectedPart ?? 0) : 0;
+    const previousParts = preserveSelectedPart ? selectedPartIndices() : null;
     const previousVariant = preserveSheetVariant ? state.sheetVariant : 'base';
     const data = await fetchScore(name);
     const prefs = loadScorePreferences(data.name);
@@ -2564,14 +2671,9 @@ async function openScore(name, options = {}) {
     state.practiceRightHand = null;
     state.practiceLeftHand = null;
     const parts = data.parts || [];
-    const preferredPart = preserveSelectedPart
-      ? previousPart
-      : Number.isInteger(prefs.selectedPart)
-        ? prefs.selectedPart
-        : 0;
-    state.selectedPart = parts.length
-      ? Math.max(0, Math.min(preferredPart, parts.length - 1))
-      : 0;
+    setSelectedPartIndices(parts.length
+      ? (previousParts || defaultSelectedPartsForScore(data, prefs))
+      : [0]);
     state.partInstruments = prefs.partInstruments && typeof prefs.partInstruments === 'object'
       ? { ...prefs.partInstruments }
       : {};
@@ -2598,18 +2700,20 @@ async function openScore(name, options = {}) {
       btns.innerHTML = parts.map((p, i) => {
         const instr = getInstrumentForPart(i);
         return `<div class="part-row" id="part-row-${i}">
-          <button class="part-btn${i === state.selectedPart ? ' selected' : ''}"
-                  onclick="selectPart(${i})" id="part-btn-${i}">
-            ${p.name}
+          <button class="part-btn${selectedPartIndices().includes(i) ? ' selected' : ''}"
+                  onclick="selectPart(${i})" id="part-btn-${i}" data-part-index="${i}"
+                  aria-pressed="${selectedPartIndices().includes(i) ? 'true' : 'false'}">
+            <span class="part-name">${escapeHtml(p.name)}</span>
           </button>
           <select class="instr-select" onchange="changeInstrument(${i}, this.value)" id="instr-${i}">
             ${INSTRUMENTS.map(ins =>
-              `<option value="${ins}"${ins === instr ? ' selected' : ''}>${INSTRUMENT_EMOJI[ins] || '🎵'} ${ins}</option>`
+              `<option value="${ins}"${ins === instr ? ' selected' : ''}>${ins}</option>`
             ).join('')}
           </select>
         </div>`;
       }).join('');
       picker.style.display = 'block';
+      updatePartSelectionUI();
     } else {
       picker.style.display = 'none';
     }
@@ -2665,17 +2769,23 @@ window.addEventListener('popstate', () => {
 });
 
 async function selectPart(idx) {
-  state.selectedPart = idx;
+  const selected = selectedPartIndices();
+  const next = selected.includes(idx)
+    ? selected.filter((partIdx) => partIdx !== idx)
+    : [...selected, idx];
+  setSelectedPartIndices(next.length ? next : selected);
   state.practiceRightHand = null;
   state.practiceLeftHand = null;
-  document.querySelectorAll('.part-btn').forEach((b, i) =>
-    b.classList.toggle('selected', i === idx));
+  updatePartSelectionUI();
   buildKeyboard(getRightHand());
   updateNextKey(getRightHand(), 0);
   renderNoteHighway();
   syncExpectedMicNote();
   preloadCurrentScoreInstruments();
-  saveCurrentScorePreferences({ selectedPart: idx });
+  saveCurrentScorePreferences({
+    selectedPart: state.selectedPart ?? 0,
+    selectedParts: selectedPartIndices(),
+  });
 }
 
 function getInstrumentForPart(idx) {
@@ -2707,7 +2817,7 @@ async function changeInstrument(partIdx, instrument) {
 
 function getRightHandRaw() {
   const parts = state.current?.parts;
-  if (parts && parts.length > 0) return parts[state.selectedPart ?? 0].notes;
+  if (parts && parts.length > 0) return mergePracticeEventsFromParts(selectedPartIndices());
   return state.current?.right_hand || [];
 }
 
@@ -2719,11 +2829,11 @@ function getRightHand() {
 function getLeftHandRaw() {
   const parts = state.current?.parts;
   if (!parts || parts.length === 0) return state.current?.left_hand || [];
-  const idx = state.selectedPart ?? 0;
+  const selected = new Set(selectedPartIndices());
 
   const left = [];
   parts.forEach((p, i) => {
-    if (i === idx) return;
+    if (selected.has(i)) return;
     const instrument = getInstrumentForPart(i);
     (p.notes || []).forEach((event) => {
       const merged = [eventPitches(event), event[1], eventDuration(event)];
@@ -2805,6 +2915,7 @@ function updateSheetHighlight(beat) {
 
   const measureEl = _sheetMeasureEls[idx];
   if (!measureEl) return;
+  const doc = measureEl.ownerDocument;
   const overlayRoot = measureEl.closest('g.page-margin')
     || measureEl.closest('svg.definition-scale')?.querySelector('g.page-margin')
     || measureEl.parentNode;
@@ -3175,12 +3286,13 @@ async function startPlaying() {
 
   // Build per-part instrument map for the accompanist (all non-selected parts)
   const parts = state.current?.parts || [];
-  const sel   = state.selectedPart ?? 0;
+  const selected = new Set(selectedPartIndices());
   const leftInstruments = parts
     .map((_, i) => i)
-    .filter(i => i !== sel)
+    .filter(i => !selected.has(i))
     .map(i => getInstrumentForPart(i));
-  const instrumentsInUse = [getInstrumentForPart(sel), ...leftInstruments];
+  const selectedInstruments = selectedPartIndices().map((idx) => getInstrumentForPart(idx));
+  const instrumentsInUse = [...selectedInstruments, ...leftInstruments];
 
   const startBtn = document.getElementById('start-btn');
   const stopBtn = document.getElementById('stop-btn');
@@ -3952,7 +4064,7 @@ function renderSearchResults(results) {
         </div>
         <button class="btn btn-primary" onclick="addPiece('${r.path}', '${safeName}')"
           ${added ? 'disabled' : ''}>
-          ${added ? '✓ Added' : '+ Add'}
+          ${added ? 'Added' : '+ Add'}
         </button>
       </div>`;
   }).join('');
@@ -3971,7 +4083,7 @@ async function addPiece(corpusPath, safeName) {
     });
     item.classList.remove('adding');
     item.classList.add('done');
-    item.querySelector('button').textContent = '✓ Added';
+    item.querySelector('button').textContent = 'Added';
     item.querySelector('button').disabled = true;
     addScoreToLibrary(safeName);
 

@@ -1789,9 +1789,16 @@ body.auth-mode .score-grid {
   padding: .45rem 1rem; border-radius: 6px; border: 1px solid var(--border-strong);
   background: var(--surface); color: var(--muted); font-size: .85rem; cursor: pointer;
   transition: all .15s;
+  display: flex;
+  align-items: center;
 }
 .part-btn:hover { border-color: var(--accent); color: var(--text); }
 .part-btn.selected { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+
+.part-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 
 .instr-select {
   padding: .35rem .6rem; border-radius: 6px; border: 1px solid var(--border-strong);
