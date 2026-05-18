@@ -22,11 +22,12 @@ import subprocess
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
-from music21 import converter, note, chord, expressions, pitch, dynamics as m21dynamics
+from music21 import converter, note, chord, expressions, pitch, dynamics as m21dynamics, stream, meter, metadata
 from src.fingering import build_fingering_state
 from src.paths import get_scores_dir
 
 MUSESCORE_SUFFIXES = {".mscx", ".mscz"}
+LILYPOND_SUFFIXES = {".ily", ".ly"}
 GRACE_NOTE_BEATS = 0.125
 DYNAMIC_VELOCITY = {
     "ppp": 0.22,
@@ -528,6 +529,20 @@ def build_parts_data(score) -> list:
     return parts_data
 
 
+def score_for_playback(score):
+    """Return a sounding-pitch copy for playback extraction.
+
+    MusicXML from notation apps often stores transposing instruments at written
+    pitch, with playback semantics carried by <transpose>. MuseScore playback
+    uses the sounding pitch; NotePilot's note events should do the same while
+    sheet rendering keeps the original notation.
+    """
+    try:
+        return score.toSoundingPitch(inPlace=False)
+    except Exception:
+        return score
+
+
 def extract_measure_beats(score) -> list[float]:
     first_part = score.parts[0] if score.parts else score
     return [float(m.offset) for m in first_part.getElementsByClass('Measure')]
@@ -596,6 +611,364 @@ def convert_musescore_to_musicxml(source: str, out_dir: str, score_name: str) ->
         raise RuntimeError(message)
 
     return out_path
+
+
+def is_lilypond_file(source: str) -> bool:
+    return os.path.splitext(source)[1].lower() in LILYPOND_SUFFIXES
+
+
+def _strip_lilypond_comments(text: str) -> str:
+    text = re.sub(r"%\{.*?%\}", " ", text, flags=re.S)
+    return "\n".join(line.split("%", 1)[0] for line in text.splitlines())
+
+
+def _balanced_lily_block(text: str, open_index: int) -> tuple[str, int]:
+    depth = 0
+    start = None
+    i = open_index
+    while i < len(text):
+        char = text[i]
+        if char == "{":
+            depth += 1
+            if start is None:
+                start = i + 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                return text[start:i], i + 1
+        i += 1
+    raise ValueError("Could not find a balanced LilyPond music block.")
+
+
+def _extract_lilypond_music_text(text: str) -> tuple[str, bool]:
+    cleaned = _strip_lilypond_comments(text)
+    relative_match = re.search(r"\\relative\s+[a-g](?:is|es|isis|eses)?[,']*\s*\{", cleaned)
+    if relative_match:
+        block, _ = _balanced_lily_block(cleaned, relative_match.end() - 1)
+        return block, True
+
+    assignment_match = re.search(r"=\s*(?:\\(?:absolute|fixed)\s+[a-g]?[,']*\s*)?\{", cleaned)
+    if assignment_match:
+        block, _ = _balanced_lily_block(cleaned, assignment_match.end() - 1)
+        return block, False
+
+    first_block = cleaned.find("{")
+    if first_block >= 0:
+        block, _ = _balanced_lily_block(cleaned, first_block)
+        return block, False
+
+    return cleaned, False
+
+
+def _expand_lilypond_repeats(text: str) -> str:
+    repeat_re = re.compile(r"\\repeat\s+unfold\s+(\d+)\s*\{")
+    while True:
+        match = repeat_re.search(text)
+        if not match:
+            return text
+        block, end = _balanced_lily_block(text, match.end() - 1)
+        count = max(0, min(128, int(match.group(1))))
+        text = text[:match.start()] + " ".join([block] * count) + text[end:]
+
+
+def _lily_duration_to_quarters(value: str | None, dots: str = "") -> float | None:
+    if not value:
+        return None
+    denominator = int(value)
+    if denominator <= 0:
+        return None
+    base = 4.0 / denominator
+    addition = base / 2.0
+    for _ in dots:
+        base += addition
+        addition /= 2.0
+    return base
+
+
+def _lily_pitch_to_midi(token: str, previous_midi: int | None = None, relative: bool = False) -> int:
+    match = re.fullmatch(r"([a-g])(isis|eses|is|es)?([,']*)", token)
+    if not match:
+        raise ValueError(f"Unsupported LilyPond pitch token: {token}")
+    step, accidental, octave_marks = match.groups()
+    semitones = {"c": 0, "d": 2, "e": 4, "f": 5, "g": 7, "a": 9, "b": 11}
+    accidental_offset = {"isis": 2, "is": 1, "eses": -2, "es": -1}.get(accidental or "", 0)
+    pitch_class = (semitones[step] + accidental_offset) % 12
+
+    if relative and previous_midi is not None:
+        octave = previous_midi // 12 - 1
+        candidates = [12 * (octave + delta + 1) + pitch_class for delta in range(-3, 4)]
+        midi = min(candidates, key=lambda candidate: abs(candidate - previous_midi))
+    else:
+        midi = 12 * (3 + 1) + pitch_class
+
+    midi += 12 * octave_marks.count("'")
+    midi -= 12 * octave_marks.count(",")
+    return max(0, min(127, midi))
+
+
+def _read_chord_token(text: str, start: int) -> tuple[str, int]:
+    end = text.find(">", start + 1)
+    if end < 0:
+        raise ValueError("Unclosed LilyPond chord.")
+    i = end + 1
+    while i < len(text) and (text[i].isdigit() or text[i] == "."):
+        i += 1
+    return text[start:i], i
+
+
+def _skip_lily_whitespace(text: str, index: int) -> int:
+    while index < len(text) and text[index].isspace():
+        index += 1
+    return index
+
+
+def _skip_lily_quoted_string(text: str, index: int) -> int:
+    if index >= len(text) or text[index] != '"':
+        return index
+    index += 1
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == '"':
+            return index + 1
+        index += 1
+    return index
+
+
+def _skip_lily_scheme_expr(text: str, index: int) -> int:
+    index = _skip_lily_whitespace(text, index)
+    if index >= len(text):
+        return index
+    if text[index] == "#":
+        index += 1
+        if index < len(text) and text[index] == "'":
+            index += 1
+        if index < len(text) and text[index] == "#":
+            return min(len(text), index + 2)
+    if index < len(text) and text[index] == "(":
+        depth = 0
+        while index < len(text):
+            char = text[index]
+            if char == '"':
+                index = _skip_lily_quoted_string(text, index)
+                continue
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth <= 0:
+                    return index + 1
+            index += 1
+        return index
+    while index < len(text) and not text[index].isspace() and text[index] not in "{}<>|[]()":
+        index += 1
+    return index
+
+
+def _skip_lily_atom(text: str, index: int) -> int:
+    index = _skip_lily_whitespace(text, index)
+    if index >= len(text):
+        return index
+    if text[index] == '"':
+        return _skip_lily_quoted_string(text, index)
+    if text[index] == "#":
+        return _skip_lily_scheme_expr(text, index)
+    if text[index] == "\\":
+        match = re.match(r"\\[A-Za-z][A-Za-z-]*", text[index:])
+        return index + len(match.group(0)) if match else index + 1
+    while index < len(text) and not text[index].isspace() and text[index] not in "{}<>|[]()":
+        index += 1
+    return index
+
+
+def _skip_lily_assignment_command(text: str, index: int) -> int:
+    # Skip commands such as "\override Beam.positions = #'(1 . 0)" without
+    # consuming the musical token that follows on the same line.
+    index = _skip_lily_whitespace(text, index)
+    while index < len(text):
+        char = text[index]
+        if char == "\n":
+            return index
+        if char == "=":
+            return _skip_lily_scheme_expr(text, index + 1)
+        if char == "#":
+            return _skip_lily_scheme_expr(text, index)
+        if char in "{}<>|":
+            return index
+        if char == "\\" and re.match(r"\\[A-Za-z][A-Za-z-]*", text[index:]):
+            return index
+        index += 1
+    return index
+
+
+def _skip_lily_command_args(name: str, text: str, index: int) -> int:
+    if name == "\\time":
+        match = re.match(r"\s*(\d+/\d+)", text[index:])
+        return index + match.end() if match else index
+    if name == "\\key":
+        index = _skip_lily_atom(text, index)
+        return _skip_lily_atom(text, index)
+    if name in {"\\clef", "\\bar", "\\mark", "\\tempo", "\\transposition"}:
+        return _skip_lily_atom(text, index)
+    if name == "\\barNumberCheck":
+        return _skip_lily_scheme_expr(text, index)
+    if name in {"\\override", "\\revert", "\\set", "\\unset"}:
+        return _skip_lily_assignment_command(text, index)
+    if name == "\\tuplet":
+        match = re.match(r"\s*\d+/\d+\s*\d*", text[index:])
+        return index + match.end() if match else index
+    return index
+
+
+def _parse_lilypond_music_to_events(text: str, *, relative: bool, progress_callback=None) -> tuple[list[tuple[list[int], float, float]], str | None]:
+    if progress_callback:
+        progress_callback(0.0)
+    music = _expand_lilypond_repeats(text)
+    if progress_callback:
+        progress_callback(0.08)
+    events: list[tuple[list[int], float, float]] = []
+    time_signature = None
+    offset = 0.0
+    last_duration = 1.0
+    previous_midi = 60
+    i = 0
+    next_progress_at = max(1000, len(music) // 20)
+
+    while i < len(music):
+        if progress_callback and i >= next_progress_at:
+            progress_callback(0.08 + 0.90 * (i / max(1, len(music))))
+            next_progress_at += max(1000, len(music) // 20)
+        char = music[i]
+        if char.isspace() or char in "|[]()~":
+            i += 1
+            continue
+        if char == '"':
+            i = _skip_lily_quoted_string(music, i)
+            continue
+        if char == "#":
+            i = _skip_lily_scheme_expr(music, i)
+            continue
+        if music.startswith("<<", i) or music.startswith(">>", i):
+            i += 2
+            continue
+        if music.startswith("\\\\", i):
+            i += 2
+            continue
+        if char == "\\":
+            command = re.match(r"\\[A-Za-z][A-Za-z-]*", music[i:])
+            if not command:
+                i += 1
+                continue
+            name = command.group(0)
+            i += len(name)
+            if name == "\\time":
+                match = re.match(r"\s*(\d+/\d+)", music[i:])
+                if match:
+                    time_signature = match.group(1)
+            i = _skip_lily_command_args(name, music, i)
+            continue
+        if char == "<":
+            token, i = _read_chord_token(music, i)
+            match = re.fullmatch(r"<([^>]+)>(\d+)?(\.*)", token)
+            if not match:
+                continue
+            pitch_tokens, duration_token, dots = match.groups()
+            duration = _lily_duration_to_quarters(duration_token, dots) or last_duration
+            midis = []
+            for pitch_token in re.findall(r"[a-g](?:isis|eses|is|es)?[,']*", pitch_tokens):
+                midi = _lily_pitch_to_midi(pitch_token, previous_midi, relative)
+                midis.append(midi)
+            if midis:
+                events.append((midis, offset, duration))
+                previous_midi = midis[-1]
+            offset += duration
+            last_duration = duration
+            continue
+        match = re.match(r"(R|[a-g](?:isis|eses|is|es)?[,']*|[rs])(\d+)?(\.*)(?:\*(\d+))?", music[i:])
+        if match:
+            pitch_token, duration_token, dots, multiplier_token = match.groups()
+            i += match.end()
+            duration = _lily_duration_to_quarters(duration_token, dots) or last_duration
+            multiplier = int(multiplier_token or "1")
+            if pitch_token not in {"R", "r", "s"}:
+                midi = _lily_pitch_to_midi(pitch_token, previous_midi, relative)
+                events.append(([midi], offset, duration))
+                previous_midi = midi
+            offset += duration * max(1, multiplier)
+            last_duration = duration
+            continue
+        i += 1
+
+    if progress_callback:
+        progress_callback(1.0)
+    return events, time_signature
+
+
+def convert_lilypond_parts_to_musicxml(sources: list[str], out_dir: str, score_name: str, progress_callback=None) -> str:
+    if not sources:
+        raise RuntimeError("No .ily files were found to import.")
+
+    def progress(percent: int, message: str):
+        if progress_callback:
+            progress_callback(max(0, min(99, int(percent))), message)
+
+    score = stream.Score(id=score_name)
+    score.metadata = metadata.Metadata()
+    score.metadata.title = humanize_score_title(score_name)
+    first_time_signature = None
+    total_sources = len(sources)
+
+    for index, source in enumerate(sources):
+        source_label = os.path.basename(source)
+        progress(35 + int((index / max(1, total_sources)) * 25), f"Reading LilyPond part {index + 1}/{total_sources}: {source_label}")
+        with open(source, encoding="utf-8-sig") as f:
+            text = f.read()
+        music_text, is_relative = _extract_lilypond_music_text(text)
+        start_percent = 35 + int((index / max(1, total_sources)) * 25)
+        end_percent = 35 + int(((index + 1) / max(1, total_sources)) * 25)
+        events, time_signature = _parse_lilypond_music_to_events(
+            music_text,
+            relative=is_relative,
+            progress_callback=lambda fraction, label=source_label, start=start_percent, end=end_percent: progress(
+                start + int((end - start) * fraction),
+                f"Parsing {label} ({int(fraction * 100)}%)",
+            ),
+        )
+        if not events:
+            raise RuntimeError(f"No playable notes were found in {os.path.basename(source)}.")
+
+        part = stream.Part(id=f"P{index + 1}")
+        part.partName = lilypond_part_name_from_path(source)
+        if time_signature and not first_time_signature:
+            first_time_signature = time_signature
+        if time_signature:
+            part.insert(0, meter.TimeSignature(time_signature))
+        elif first_time_signature:
+            part.insert(0, meter.TimeSignature(first_time_signature))
+
+        for midis, offset, duration in events:
+            if len(midis) == 1:
+                event_pitch = pitch.Pitch()
+                event_pitch.midi = midis[0]
+                event = note.Note(event_pitch)
+            else:
+                event = chord.Chord(midis)
+            event.quarterLength = duration
+            part.insert(offset, event)
+        score.insert(0, part)
+        progress(35 + int(((index + 1) / max(1, total_sources)) * 25), f"Parsed {source_label} ({len(events)} events)")
+
+    out_path = os.path.join(out_dir, f"{score_name}__lilypond.musicxml")
+    os.makedirs(out_dir, exist_ok=True)
+    progress(64, "Writing LilyPond MusicXML")
+    return score.write("musicxml", fp=out_path)
+
+
+def lilypond_part_name_from_path(source: str) -> str:
+    stem = os.path.splitext(os.path.basename(source))[0]
+    stem = re.sub(r"^\d+[_\-\s]+", "", stem)
+    return humanize_score_title(stem)
 
 
 def _xml_local_name(tag: str) -> str:
@@ -703,18 +1076,20 @@ def convert_score_source(source: str, *, name: str | None = None, out_dir: str |
         render_source_path = mxl_path
         used_parse_fallback = False
     else:
-        mxl_path = (
-            convert_musescore_to_musicxml(source, out_dir, score_name)
-            if is_musescore_file(source)
-            else source
-        )
+        if is_musescore_file(source):
+            mxl_path = convert_musescore_to_musicxml(source, out_dir, score_name)
+        elif is_lilypond_file(source):
+            mxl_path = convert_lilypond_parts_to_musicxml([source], out_dir, score_name)
+        else:
+            mxl_path = source
         fallback_musicxml_path = os.path.join(out_dir, f"{score_name}__sanitized.musicxml")
         score, render_source_path, used_parse_fallback = _parse_uploaded_musicxml(
             mxl_path,
             fallback_musicxml_path=fallback_musicxml_path,
         )
 
-    parts_data = build_parts_data(score)
+    playback_score = score_for_playback(score)
+    parts_data = build_parts_data(playback_score)
     measure_beats = extract_measure_beats(score)
     title = score.metadata.title if score.metadata and score.metadata.title else title_fallback
     out_py = os.path.join(out_dir, f"{score_name}.py")
@@ -753,6 +1128,33 @@ def convert_score_source(source: str, *, name: str | None = None, out_dir: str |
 def _detect_instrument(part) -> str:
     """Infer an instrument name from a music21 part."""
     from music21 import instrument as m21i
+    name = (part.partName or "").lower()
+
+    # Prefer explicit part-name cues for imported LilyPond/MusicXML files where
+    # music21 may not attach a concrete Instrument object.
+    for kw, result in [
+        ("piano", "piano"),
+        ("contrabass", "contrabass"),
+        ("contrabasses", "contrabass"),
+        ("double bass", "contrabass"),
+        ("violin", "violin"),
+        ("viola", "viola"),
+        ("cello", "cello"),
+        ("violoncello", "cello"),
+        ("bassoon", "bassoon"),
+        ("trumpet", "trumpet"),
+        ("horn", "horn"),
+        ("clarinet", "clarinet"),
+        ("flute", "flute"),
+        ("oboe", "oboe"),
+        ("bass", "cello"),
+        ("soprano", "flute"),
+        ("alto", "clarinet"),
+        ("tenor", "violin"),
+    ]:
+        if kw in name:
+            return result
+
     try:
         instr = part.getInstrument()
     except Exception:
@@ -760,8 +1162,6 @@ def _detect_instrument(part) -> str:
 
     if instr is None:
         return "piano"
-
-    name = (part.partName or "").lower()
 
     # Use class hierarchy first (most reliable)
     if isinstance(instr, m21i.KeyboardInstrument):
@@ -772,6 +1172,8 @@ def _detect_instrument(part) -> str:
         return "viola"
     if isinstance(instr, (m21i.Violoncello,)):
         return "cello"
+    if isinstance(instr, (getattr(m21i, "Contrabass", tuple()),)):
+        return "contrabass"
     if isinstance(instr, m21i.StringInstrument):
         return "strings"
     if isinstance(instr, (m21i.Flute,)):
@@ -780,20 +1182,16 @@ def _detect_instrument(part) -> str:
         return "clarinet"
     if isinstance(instr, (m21i.Oboe,)):
         return "oboe"
+    if isinstance(instr, (m21i.Bassoon,)):
+        return "bassoon"
+    if isinstance(instr, (m21i.Trumpet,)):
+        return "trumpet"
+    if isinstance(instr, (m21i.Horn,)):
+        return "horn"
     if isinstance(instr, m21i.WoodwindInstrument):
-        return "flute"
+        return "clarinet"
     if isinstance(instr, m21i.BrassInstrument):
-        return "strings"  # approximate brass with strings for now
-
-    # Fall back to part name keywords
-    for kw, result in [
-        ("violin", "violin"), ("viola", "viola"), ("cello", "cello"),
-        ("bass", "cello"), ("flute", "flute"), ("clarinet", "clarinet"),
-        ("oboe", "oboe"), ("soprano", "flute"), ("alto", "clarinet"),
-        ("tenor", "violin"), ("piano", "piano"),
-    ]:
-        if kw in name:
-            return result
+        return "horn"
 
     return "piano"
 

@@ -522,6 +522,58 @@ body.auth-mode .score-grid {
   color: var(--muted);
 }
 
+.import-progress {
+  display: grid;
+  gap: .35rem;
+  padding: .7rem .75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface) 90%, var(--accent) 10%);
+}
+
+.import-progress[hidden] {
+  display: none;
+}
+
+.import-progress-track {
+  position: relative;
+  height: .45rem;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--border) 70%, transparent);
+}
+
+.import-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width .25s ease;
+}
+
+.import-progress.active .import-progress-fill::after {
+  content: "";
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.32), transparent);
+  animation: import-progress-sheen 1.15s linear infinite;
+}
+
+.import-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .75rem;
+  color: var(--muted);
+  font-size: .76rem;
+  font-weight: 650;
+}
+
+@keyframes import-progress-sheen {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(100%); }
+}
+
 /* ── Screens ── */
 .screen { display: none; padding: 2rem; max-width: 960px; margin: 0 auto; }
 .screen.active { display: block; }
@@ -711,16 +763,23 @@ body.auth-mode .score-grid {
   color: var(--muted-2);
   font-size: .85rem;
 }
-.delete-btn {
+.score-card-actions {
   position: absolute;
   top: .55rem;
   right: .55rem;
   z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: .25rem;
+}
+.delete-btn,
+.rename-btn {
   flex-shrink: 0; background: color-mix(in srgb, var(--bg) 86%, transparent); border: none; color: var(--muted);
   font-size: 1rem; cursor: pointer; padding: .25rem .4rem; border-radius: 4px;
   transition: color .15s, background .15s;
 }
 .delete-btn:hover { color: #e05c5c; background: #2a1a1a; }
+.rename-btn:hover { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--bg)); }
 
 @media (max-width: 1100px) {
   .score-grid {
@@ -1387,6 +1446,9 @@ body.auth-mode .score-grid {
   font-size: .92rem;
   font-weight: 750;
   letter-spacing: .01em;
+}
+.keyboard-loading.error {
+  color: #f0c35a;
 }
 .note-highway {
   position: relative;

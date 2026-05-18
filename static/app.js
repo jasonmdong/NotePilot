@@ -34,10 +34,24 @@ const VISUAL_SLOTS = [
 function pitchName(midi) { return NOTE_NAMES[midi % 12] + (Math.floor(midi/12)-1); }
 function isBlackKeyMidi(midi) { return [1, 3, 6, 8, 10].includes(midi % 12); }
 
-const INSTRUMENTS = ['piano','violin','viola','cello','strings','flute','clarinet','oboe','voice'];
+const INSTRUMENTS = [
+  'piano',
+  'violin',
+  'viola',
+  'cello',
+  'contrabass',
+  'strings',
+  'flute',
+  'clarinet',
+  'oboe',
+  'bassoon',
+  'horn',
+  'trumpet',
+  'voice',
+];
 const INSTRUMENT_EMOJI = {
-  piano:'🎹', violin:'🎻', viola:'🎻', cello:'🎻', strings:'🎻',
-  flute:'🪈', clarinet:'🎷', oboe:'🎷', voice:'🎤',
+  piano:'🎹', violin:'🎻', viola:'🎻', cello:'🎻', contrabass:'🎻', strings:'🎻',
+  flute:'🪈', clarinet:'🎷', oboe:'🎷', bassoon:'🎷', horn:'📯', trumpet:'🎺', voice:'🎤',
 };
 const TEMPO_PAUSE_IGNORE_SEC = 3;
 let _accompanimentLatencyCompSec = 0.28;
@@ -55,148 +69,51 @@ function audioCtx() {
   return _audioCtx;
 }
 
-const SAMPLE_ALIAS = {
-  viola: 'violin',
-  strings: 'violin',
-  oboe: 'clarinet',
-};
+const SOUNDFONT_BASE = 'https://gleitz.github.io/midi-js-soundfonts/FluidR3_GM/';
+const SAMPLE_ALIAS = {};
+
+function soundfontFile(noteName) {
+  return `${noteName.replace('#', 's')}.mp3`;
+}
+
+function soundfontUrls(notes) {
+  return Object.fromEntries(notes.map((noteName) => [noteName, soundfontFile(noteName)]));
+}
+
+function soundfontNotes(octaveStart, octaveEnd) {
+  const anchors = ['C', 'D', 'F', 'G', 'A'];
+  const notes = [];
+  for (let octave = octaveStart; octave <= octaveEnd; octave++) {
+    anchors.forEach((anchor) => notes.push(`${anchor}${octave}`));
+  }
+  notes.push(`C${octaveEnd + 1}`);
+  return notes;
+}
+
+function soundfontPreset(folder, octaveStart, octaveEnd, options = {}) {
+  return {
+    baseUrl: `${SOUNDFONT_BASE}${folder}-mp3/`,
+    release: options.release ?? 0.28,
+    noteDuration: options.noteDuration ?? 0.48,
+    gainDb: options.gainDb ?? 0,
+    urls: soundfontUrls(options.notes || soundfontNotes(octaveStart, octaveEnd)),
+  };
+}
 
 const SAMPLE_LIBRARY = {
-  piano: {
-    baseUrl: 'https://tonejs.github.io/audio/salamander/',
-    release: 0.45,
-    noteDuration: 0.5,
-    urls: {
-      A0: 'A0.mp3',
-      C1: 'C1.mp3',
-      'D#1': 'Ds1.mp3',
-      'F#1': 'Fs1.mp3',
-      A1: 'A1.mp3',
-      C2: 'C2.mp3',
-      'D#2': 'Ds2.mp3',
-      'F#2': 'Fs2.mp3',
-      A2: 'A2.mp3',
-      C3: 'C3.mp3',
-      'D#3': 'Ds3.mp3',
-      'F#3': 'Fs3.mp3',
-      A3: 'A3.mp3',
-      C4: 'C4.mp3',
-      'D#4': 'Ds4.mp3',
-      'F#4': 'Fs4.mp3',
-      A4: 'A4.mp3',
-      C5: 'C5.mp3',
-      'D#5': 'Ds5.mp3',
-      'F#5': 'Fs5.mp3',
-      A5: 'A5.mp3',
-      C6: 'C6.mp3',
-      'D#6': 'Ds6.mp3',
-      'F#6': 'Fs6.mp3',
-      A6: 'A6.mp3',
-      C7: 'C7.mp3',
-      'D#7': 'Ds7.mp3',
-      'F#7': 'Fs7.mp3',
-      A7: 'A7.mp3',
-      C8: 'C8.mp3',
-    },
-  },
-  violin: {
-    baseUrl: 'https://cdn.jsdelivr.net/npm/tonejs-instrument-violin-mp3@1.1.1/',
-    release: 0.35,
-    noteDuration: 0.45,
-    urls: {
-      A3: 'A3.mp3',
-      A4: 'A4.mp3',
-      A5: 'A5.mp3',
-      A6: 'A6.mp3',
-      C4: 'C4.mp3',
-      C5: 'C5.mp3',
-      C6: 'C6.mp3',
-      C7: 'C7.mp3',
-      E4: 'E4.mp3',
-      E5: 'E5.mp3',
-      E6: 'E6.mp3',
-      G3: 'G3.mp3',
-      G4: 'G4.mp3',
-      G5: 'G5.mp3',
-      G6: 'G6.mp3',
-    },
-  },
-  cello: {
-    baseUrl: 'https://cdn.jsdelivr.net/npm/tonejs-instrument-cello-mp3@1.1.1/',
-    release: 0.4,
-    noteDuration: 0.5,
-    urls: {
-      A2: 'A2.mp3',
-      A3: 'A3.mp3',
-      A4: 'A4.mp3',
-      'A#2': 'As2.mp3',
-      'A#3': 'As3.mp3',
-      'A#4': 'As4.mp3',
-      B2: 'B2.mp3',
-      B3: 'B3.mp3',
-      B4: 'B4.mp3',
-      C2: 'C2.mp3',
-      C3: 'C3.mp3',
-      C4: 'C4.mp3',
-      C5: 'C5.mp3',
-      'C#3': 'Cs3.mp3',
-      'C#4': 'Cs4.mp3',
-      D2: 'D2.mp3',
-      D3: 'D3.mp3',
-      D4: 'D4.mp3',
-      'D#2': 'Ds2.mp3',
-      'D#3': 'Ds3.mp3',
-      'D#4': 'Ds4.mp3',
-      E2: 'E2.mp3',
-      E3: 'E3.mp3',
-      E4: 'E4.mp3',
-      F3: 'F3.mp3',
-      F4: 'F4.mp3',
-      'F#3': 'Fs3.mp3',
-      'F#4': 'Fs4.mp3',
-      G2: 'G2.mp3',
-      G3: 'G3.mp3',
-      G4: 'G4.mp3',
-      'G#2': 'Gs2.mp3',
-      'G#3': 'Gs3.mp3',
-      'G#4': 'Gs4.mp3',
-    },
-  },
-  flute: {
-    baseUrl: 'https://cdn.jsdelivr.net/npm/tonejs-instrument-flute-mp3@1.1.2/',
-    release: 0.25,
-    noteDuration: 0.4,
-    urls: {
-      A4: 'A4.mp3',
-      A5: 'A5.mp3',
-      A6: 'A6.mp3',
-      C4: 'C4.mp3',
-      C5: 'C5.mp3',
-      C6: 'C6.mp3',
-      C7: 'C7.mp3',
-      E4: 'E4.mp3',
-      E5: 'E5.mp3',
-      E6: 'E6.mp3',
-    },
-  },
-  clarinet: {
-    baseUrl: 'https://cdn.jsdelivr.net/npm/tonejs-instrument-clarinet-ogg@1.1.0/',
-    release: 0.3,
-    noteDuration: 0.42,
-    urls: {
-      'A#3': 'As3.ogg',
-      'A#4': 'As4.ogg',
-      'A#5': 'As5.ogg',
-      D3: 'D3.ogg',
-      D4: 'D4.ogg',
-      D5: 'D5.ogg',
-      D6: 'D6.ogg',
-      F3: 'F3.ogg',
-      F4: 'F4.ogg',
-      F5: 'F5.ogg',
-      'F#6': 'Fs6.ogg',
-    },
-  },
+  piano: soundfontPreset('acoustic_grand_piano', 1, 7, { release: 0.38, noteDuration: 0.46, gainDb: -1 }),
+  violin: soundfontPreset('violin', 3, 6, { release: 0.42, noteDuration: 0.55, gainDb: -3 }),
+  viola: soundfontPreset('viola', 2, 5, { release: 0.42, noteDuration: 0.56, gainDb: -3 }),
+  cello: soundfontPreset('cello', 2, 5, { release: 0.44, noteDuration: 0.58, gainDb: -2 }),
+  contrabass: soundfontPreset('contrabass', 1, 4, { release: 0.48, noteDuration: 0.62, gainDb: -2 }),
+  strings: soundfontPreset('string_ensemble_1', 2, 6, { release: 0.55, noteDuration: 0.7, gainDb: -4 }),
+  flute: soundfontPreset('flute', 4, 7, { release: 0.24, noteDuration: 0.44, gainDb: -4 }),
+  clarinet: soundfontPreset('clarinet', 3, 6, { release: 0.28, noteDuration: 0.46, gainDb: -3 }),
+  oboe: soundfontPreset('oboe', 3, 6, { release: 0.24, noteDuration: 0.44, gainDb: -4 }),
+  bassoon: soundfontPreset('bassoon', 1, 4, { release: 0.3, noteDuration: 0.5, gainDb: -3 }),
+  horn: soundfontPreset('french_horn', 2, 5, { release: 0.36, noteDuration: 0.58, gainDb: -5 }),
+  trumpet: soundfontPreset('trumpet', 3, 6, { release: 0.24, noteDuration: 0.42, gainDb: -5 }),
+  voice: soundfontPreset('choir_aahs', 3, 6, { release: 0.55, noteDuration: 0.72, gainDb: -5 }),
 };
 
 let _toneReady = false;
@@ -209,10 +126,14 @@ const INSTRUMENT_PRESETS = {
   violin:   { harmonics:[[1,.5],[2,.25],[3,.15],[4,.07],[5,.03]], attack:.06, decay:.4, type:'sawtooth', vibrato:true },
   viola:    { harmonics:[[1,.55],[2,.25],[3,.13],[4,.05],[5,.02]], attack:.07, decay:.35, type:'sawtooth', vibrato:true },
   cello:    { harmonics:[[1,.6],[2,.22],[3,.12],[4,.04],[5,.02]], attack:.08, decay:.3,  type:'sawtooth', vibrato:true },
+  contrabass:{ harmonics:[[1,.72],[2,.18],[3,.08],[4,.03]], attack:.1, decay:.34, type:'sawtooth', vibrato:true },
   strings:  { harmonics:[[1,.5],[2,.2],[3,.15],[4,.1],[5,.05]],  attack:.09, decay:.25, type:'sawtooth', vibrato:true },
   flute:    { harmonics:[[1,.85],[2,.12],[3,.03]], attack:.04, decay:.4,  type:'sine',  noise:.04  },
   clarinet: { harmonics:[[1,.7],[3,.25],[5,.08],[7,.03]], attack:.025, decay:.5, type:'sine' },
   oboe:     { harmonics:[[1,.5],[2,.3],[3,.15],[4,.05]], attack:.02,  decay:.6,  type:'sine' },
+  bassoon:  { harmonics:[[1,.68],[2,.17],[3,.12],[4,.05]], attack:.035, decay:.48, type:'triangle' },
+  horn:     { harmonics:[[1,.55],[2,.28],[3,.12],[4,.05]], attack:.045, decay:.5, type:'triangle' },
+  trumpet:  { harmonics:[[1,.52],[2,.32],[3,.18],[4,.08]], attack:.018, decay:.36, type:'sawtooth' },
   voice:    { harmonics:[[1,.62],[2,.2],[3,.1],[4,.05],[5,.03]], attack:.05, decay:.55, type:'triangle', vibrato:true },
 };
 
@@ -231,8 +152,8 @@ function noteDurationSeconds(instrument, baseSeconds) {
   const sampledInstrument = SAMPLE_ALIAS[instrument] || instrument;
   const bps = Math.max(0.5, currentBps());
   const tempoScale = Math.max(0.75, Math.min(1.9, 2 / bps));
-  const familyBoost = ['violin', 'viola', 'cello', 'strings'].includes(instrument) ? 1.15 : 1.0;
-  const aliasBoost = ['violin', 'cello'].includes(sampledInstrument) ? 1.1 : 1.0;
+  const familyBoost = ['violin', 'viola', 'cello', 'contrabass', 'strings', 'voice'].includes(instrument) ? 1.12 : 1.0;
+  const aliasBoost = ['violin', 'viola', 'cello', 'contrabass', 'strings'].includes(sampledInstrument) ? 1.08 : 1.0;
   return Math.max(0.18, Math.min(1.25, baseSeconds * tempoScale * familyBoost * aliasBoost));
 }
 
@@ -266,6 +187,18 @@ function eventDynamic(event) {
   return eventMetadata(event, 'dynamic');
 }
 
+function eventSourceInstrument(event) {
+  const source = eventMetadata(event, 'instrument');
+  return typeof source?.instrument === 'string' ? source.instrument : null;
+}
+
+function appendEventMetadata(event, metadata) {
+  if (!metadata) return event;
+  if (event.length === 3) event.push(null);
+  event.push(metadata);
+  return event;
+}
+
 function eventVelocity(event, fallback = 0.5) {
   const velocity = Number(eventDynamic(event)?.velocity);
   return Number.isFinite(velocity)
@@ -293,28 +226,28 @@ function eventDurationSeconds(event, instrument = 'piano', fallbackBeats = 0.75)
 
 function isSustainedStringInstrument(instrument) {
   const normalized = String(instrument || '').trim().toLowerCase();
-  return ['violin', 'viola', 'cello', 'strings', 'string ensemble'].includes(normalized);
+  return ['violin', 'viola', 'cello', 'contrabass', 'strings', 'string ensemble'].includes(normalized);
 }
 
 function ensurePedalResonanceBus() {
   if (_pedalResonanceBus) return _pedalResonanceBus;
   const ctx = audioCtx();
   const convolver = ctx.createConvolver();
-  const impulseSeconds = 2.4;
+  const impulseSeconds = 1.15;
   const length = Math.floor(ctx.sampleRate * impulseSeconds);
   const impulse = ctx.createBuffer(2, length, ctx.sampleRate);
   for (let channel = 0; channel < impulse.numberOfChannels; channel++) {
     const data = impulse.getChannelData(channel);
     for (let i = 0; i < length; i++) {
       const t = i / length;
-      const decay = Math.pow(1 - t, 2.2);
-      data[i] = (Math.random() * 2 - 1) * decay * 0.22;
+      const decay = Math.pow(1 - t, 3.2);
+      data[i] = (Math.random() * 2 - 1) * decay * 0.08;
     }
   }
   convolver.buffer = impulse;
 
   const pre = ctx.createGain();
-  pre.gain.value = 0.55;
+  pre.gain.value = 0.32;
   const lowpass = ctx.createBiquadFilter();
   lowpass.type = 'lowpass';
   lowpass.frequency.value = 2800;
@@ -322,7 +255,7 @@ function ensurePedalResonanceBus() {
   highpass.type = 'highpass';
   highpass.frequency.value = 110;
   const wet = ctx.createGain();
-  wet.gain.value = 0.05;
+  wet.gain.value = 0.02;
 
   pre.connect(convolver);
   convolver.connect(lowpass);
@@ -336,12 +269,13 @@ function ensurePedalResonanceBus() {
 
 function playPedalResonance(pitches, velocity = 0.5, opts = {}) {
   if (!pitches?.length) return;
+  const resonancePitches = [...new Set(pitches)].slice(0, 8);
   const ctx = audioCtx();
   const now = ctx.currentTime;
   const { pre, wet } = ensurePedalResonanceBus();
-  const duration = Math.max(0.7, Math.min(12, (opts.duration ?? 1.5) * 1.9 + 0.45));
+  const duration = Math.max(0.35, Math.min(4.2, (opts.duration ?? 1.2) * 0.95 + 0.2));
   const pedalHold = Math.max(duration, opts.pedalHold ?? duration);
-  const resonanceGain = Math.min(0.16, 0.08 + velocity * 0.06) / Math.sqrt(pitches.length);
+  const resonanceGain = Math.min(0.07, 0.025 + velocity * 0.035) / Math.sqrt(resonancePitches.length);
   const harmonicShape = [
     [1, 1.0],
     [2, 0.65],
@@ -351,12 +285,12 @@ function playPedalResonance(pitches, velocity = 0.5, opts = {}) {
   ];
 
   wet.gain.cancelScheduledValues(now);
-  wet.gain.setValueAtTime(Math.max(0.05, wet.gain.value), now);
-  wet.gain.linearRampToValueAtTime(Math.max(0.18, 0.12 + velocity * 0.12), now + 0.08);
-  wet.gain.setValueAtTime(Math.max(0.18, 0.12 + velocity * 0.12), now + pedalHold);
-  wet.gain.exponentialRampToValueAtTime(0.05, now + pedalHold + 0.45);
+  wet.gain.setValueAtTime(Math.max(0.018, wet.gain.value), now);
+  wet.gain.linearRampToValueAtTime(Math.max(0.045, 0.035 + velocity * 0.035), now + 0.05);
+  wet.gain.setValueAtTime(Math.max(0.045, 0.035 + velocity * 0.035), now + pedalHold);
+  wet.gain.exponentialRampToValueAtTime(0.018, now + pedalHold + 0.25);
 
-  pitches.forEach((midi) => {
+  resonancePitches.forEach((midi) => {
     const fundamental = 440 * Math.pow(2, (midi - 69) / 12);
     harmonicShape.forEach(([mult, amp], idx) => {
       const osc = ctx.createOscillator();
@@ -386,7 +320,6 @@ function playPedalResonance(pitches, velocity = 0.5, opts = {}) {
 
 async function ensureSamplePlayback(instruments = []) {
   const requested = [...new Set(instruments
-    .filter(ins => !isSustainedStringInstrument(ins))
     .map(ins => SAMPLE_ALIAS[ins] || ins)
     .filter(ins => SAMPLE_LIBRARY[ins]))];
   if (!requested.length || typeof Tone === 'undefined') return false;
@@ -406,13 +339,15 @@ async function ensureSamplePlayback(instruments = []) {
     if (!_sampleSamplerReady[instrument]) {
       const config = SAMPLE_LIBRARY[instrument];
       _sampleSamplerReady[instrument] = new Promise((resolve, reject) => {
-        _sampleSamplers[instrument] = new Tone.Sampler({
+        const sampler = new Tone.Sampler({
           urls: config.urls,
           baseUrl: config.baseUrl,
           release: config.release,
           onload: resolve,
           onerror: reject,
-        }).toDestination();
+        });
+        if (Number.isFinite(config.gainDb)) sampler.volume.value = config.gainDb;
+        _sampleSamplers[instrument] = sampler.toDestination();
       }).catch((error) => {
         console.warn(`Tone sampler load failed for ${instrument}:`, error);
         _sampleSamplerReady[instrument] = null;
@@ -428,7 +363,6 @@ async function ensureSamplePlayback(instruments = []) {
 }
 
 function isSampleBackedInstrument(instrument) {
-  if (isSustainedStringInstrument(instrument)) return false;
   const sampledInstrument = SAMPLE_ALIAS[instrument] || instrument;
   return !!SAMPLE_LIBRARY[sampledInstrument];
 }
@@ -515,17 +449,13 @@ function playSynthNote(midi, velocity = 0.6, instrument = 'piano', opts = {}) {
 }
 
 function playNote(midi, velocity = 0.6, instrument = 'piano', opts = {}) {
-  if (isSustainedStringInstrument(instrument)) {
-    playSynthNote(midi, velocity, instrument, { ...opts, preferSynth: true });
-    return;
-  }
   const sampledInstrument = SAMPLE_ALIAS[instrument] || instrument;
   const sampler = _sampleSamplers[sampledInstrument];
   if (sampler && !opts.preferSynth) {
     const baseDuration = SAMPLE_LIBRARY[sampledInstrument]?.noteDuration ?? 0.45;
     const duration = Math.max(0.12, opts.duration ?? noteDurationSeconds(instrument, baseDuration));
     sampler.triggerAttackRelease(midiToToneNote(midi), duration, undefined, Math.min(1, velocity));
-    if (instrument === 'piano' && opts.pedaled) {
+    if (instrument === 'piano' && opts.pedaled && !opts.suppressPedalResonance) {
       playPedalResonance([midi], velocity, opts);
     }
     return;
@@ -537,7 +467,10 @@ function playNote(midi, velocity = 0.6, instrument = 'piano', opts = {}) {
 function playChord(pitches, velocity = 0.5, instrument = 'piano', opts = {}) {
   const chordSize = Math.max(1, pitches.length);
   const noteVelocity = Math.min(1, Math.max(0.08, velocity / Math.sqrt(chordSize) + 0.08));
-  pitches.forEach(p => playNote(p, noteVelocity, instrument, opts));
+  const noteOpts = instrument === 'piano' && opts.pedaled
+    ? { ...opts, suppressPedalResonance: true }
+    : opts;
+  pitches.forEach(p => playNote(p, noteVelocity, instrument, noteOpts));
   if (instrument === 'piano' && opts.pedaled) {
     playPedalResonance(pitches, velocity, opts);
   }
@@ -578,16 +511,15 @@ function expandedTremoloEvents(event, bps = currentBps()) {
   const intervalBeats = durationBeats / attackCount;
   const pedalRelease = eventPedalRelease(event);
   const dynamic = eventDynamic(event);
+  const sourceInstrument = eventSourceInstrument(event);
 
   return Array.from({ length: attackCount }, (_, idx) => {
     const group = groups[idx % groups.length];
     const payload = group.length === 1 ? group[0] : group;
     const expanded = [payload, beat + idx * intervalBeats, intervalBeats];
     if (pedalRelease !== null) expanded.push(pedalRelease);
-    if (dynamic) {
-      if (expanded.length === 3) expanded.push(null);
-      expanded.push(dynamic);
-    }
+    appendEventMetadata(expanded, dynamic);
+    appendEventMetadata(expanded, sourceInstrument ? { type: 'instrument', instrument: sourceInstrument } : null);
     return expanded;
   });
 }
@@ -796,7 +728,7 @@ class Accompanist {
       if (beat < this._nextSync - 0.01) {
         const current = this._currentBeat();
         if (current >= beat - 0.005) {
-          const instr = this._instruments[0] || 'piano';
+          const instr = eventSourceInstrument(this.events[this._lhIdx]) || this._instruments[0] || 'piano';
           const duration = Math.max(0.12, (durationBeats ?? 0.75) / Math.max(0.5, this._bps));
           const pedalRelease = eventPedalRelease(this.events[this._lhIdx]);
           playChord(pitches, eventVelocity(this.events[this._lhIdx]), instr, {
@@ -817,6 +749,7 @@ class Accompanist {
 let state = {
   scores:           [],
   serverScores:     [],
+  scoreMeta:        {},
   current:          null,
   fingeringJob:     null,
   tracker:          null,
@@ -856,6 +789,8 @@ const SHELL_SPLIT_KEY = 'accompy_shell_split_px_v1';
 const PANEL_SPLIT_KEY = 'accompy_panel_split_px_v1';
 const GUEST_MODE_KEY = 'notepilot_guest_mode_v1';
 const GUEST_PROGRESS_KEY = 'notepilot_guest_progress_v1';
+const SCORE_RECENTS_KEY = 'notepilot_recent_scores_v1';
+const SCORE_PREFS_KEY = 'notepilot_score_preferences_v1';
 const PRACTICE_SPLITTER_SIZE = 12;
 const LAYOUT_SPLITTER_SIZE = 12;
 let _appConfig = { supabase_enabled: false, auth_enabled: false };
@@ -931,7 +866,7 @@ function isGuestScoreName(name) {
 }
 
 function displayNameForScore(name) {
-  return guestScoreByName(name)?.title || formatName(name);
+  return guestScoreByName(name)?.title || state.scoreMeta?.[name]?.title || formatName(name);
 }
 
 function guestScorePayload(score) {
@@ -1068,6 +1003,7 @@ function goHome() {
   if (state.playing) stopPlaying();
   updateScoreUrl(null);
   showScreen('list-screen');
+  loadScoreList().catch((error) => console.warn('Could not refresh score list:', error));
 }
 
 window.goHome = goHome;
@@ -1353,6 +1289,7 @@ async function signOut() {
   state.current = null;
   state.scores = [];
   state.serverScores = [];
+  state.scoreMeta = {};
   state.sheetSource = null;
   state.sheetVariant = 'base';
   updateAuthUI();
@@ -1450,6 +1387,79 @@ function removeScoreFromLibrary(name) {
   return savePersonalScoreLibrary(loadPersonalScoreLibrary().filter((item) => item !== name));
 }
 
+function userStorageSuffix() {
+  if (state.guestMode) return 'guest';
+  return _authUser?.id || _authUser?.username || 'local';
+}
+
+function scopedStorageKey(base) {
+  return `${base}_${userStorageSuffix()}`;
+}
+
+function readJsonStorage(key, fallback) {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(key) || '');
+    return parsed ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJsonStorage(key, value) {
+  localStorage.setItem(key, JSON.stringify(value));
+}
+
+function loadRecentScores() {
+  const data = readJsonStorage(scopedStorageKey(SCORE_RECENTS_KEY), {});
+  return data && typeof data === 'object' ? data : {};
+}
+
+function markScoreOpened(name) {
+  if (!name) return;
+  const recents = loadRecentScores();
+  recents[name] = Date.now();
+  writeJsonStorage(scopedStorageKey(SCORE_RECENTS_KEY), recents);
+}
+
+function sortScoreItemsByRecent(items) {
+  const recents = loadRecentScores();
+  return [...items].sort((a, b) => {
+    const recentDelta = (recents[b.name] || 0) - (recents[a.name] || 0);
+    if (recentDelta) return recentDelta;
+    return displayNameForScore(a.name).localeCompare(displayNameForScore(b.name));
+  });
+}
+
+function loadAllScorePreferences() {
+  const data = readJsonStorage(scopedStorageKey(SCORE_PREFS_KEY), {});
+  return data && typeof data === 'object' ? data : {};
+}
+
+function loadScorePreferences(name) {
+  return loadAllScorePreferences()[name] || {};
+}
+
+function saveScorePreferences(name, prefs) {
+  if (!name) return;
+  const all = loadAllScorePreferences();
+  all[name] = { ...(all[name] || {}), ...prefs };
+  writeJsonStorage(scopedStorageKey(SCORE_PREFS_KEY), all);
+}
+
+function saveCurrentScorePreferences(extra = {}) {
+  const name = state.current?.name;
+  if (!name) return;
+  const bpm = Number.parseFloat(document.getElementById('bpm-input')?.value);
+  saveScorePreferences(name, {
+    bpm: Number.isFinite(bpm) ? bpm : undefined,
+    inputMode: _inputMode,
+    keyboardLayoutMode: state.keyboardLayoutMode,
+    selectedPart: state.selectedPart ?? 0,
+    partInstruments: { ...(state.partInstruments || {}) },
+    ...extra,
+  });
+}
+
 function normalizedScoreGridColumns(value) {
   const n = Number.parseInt(value, 10);
   if (!Number.isFinite(n)) return 3;
@@ -1501,6 +1511,7 @@ function applyKeyboardLayoutMode(mode) {
 function setKeyboardLayoutMode(mode) {
   applyKeyboardLayoutMode(mode);
   localStorage.setItem('accompy_keyboard_layout_mode', state.keyboardLayoutMode);
+  saveCurrentScorePreferences({ keyboardLayoutMode: state.keyboardLayoutMode });
   queuePracticeLayoutRender();
 }
 
@@ -1883,18 +1894,23 @@ async function loadScoreList() {
   state.serverScores = scores;
   const grid = document.getElementById('score-grid');
   const itemByName = new Map((items.length ? items : scores.map(name => ({ name, has_sheet: false }))).map((item) => [item.name, item]));
+  state.scoreMeta = Object.fromEntries((items.length ? items : scores.map(name => ({ name }))).map((item) => [
+    item.name,
+    { title: item.title || formatName(item.name), created_at: item.created_at || null },
+  ]));
   let scoreItems;
   if (_appConfig.auth_enabled) {
-    state.scores = [...scores];
-    scoreItems = (items.length ? items : scores.map(name => ({ name, has_sheet: false })));
+    scoreItems = sortScoreItemsByRecent(items.length ? items : scores.map(name => ({ name, has_sheet: false })));
+    state.scores = scoreItems.map((item) => item.name);
   } else {
     const existing = new Set(scores);
     let library = loadPersonalScoreLibrary();
     if (!localStorage.getItem(SCORE_LIBRARY_INIT_KEY)) library = scores;
     library = savePersonalScoreLibrary(library.filter((name) => existing.has(name)));
-    scoreItems = library
+    scoreItems = sortScoreItemsByRecent(library
       .map((name) => itemByName.get(name))
-      .filter(Boolean);
+      .filter(Boolean));
+    state.scores = scoreItems.map((item) => item.name);
   }
   if (scoreItems.length === 0) {
     grid.innerHTML = `
@@ -1907,7 +1923,10 @@ async function loadScoreList() {
   }
   grid.innerHTML = scoreItems.map(({ name, has_sheet }) => `
     <div class="score-card" id="card-${name}" onclick="openScore('${name}')">
-      <button class="delete-btn" onclick="deleteScore(event, '${name}')" title="Remove from my list">✕</button>
+      <div class="score-card-actions">
+        <button class="rename-btn" onclick="renameScore(event, '${name}')" title="Rename piece">✎</button>
+        <button class="delete-btn" onclick="deleteScore(event, '${name}')" title="Remove from my list">✕</button>
+      </div>
       <div class="score-preview${has_sheet ? '' : ' empty'}">
         ${has_sheet
           ? `<iframe
@@ -1920,7 +1939,7 @@ async function loadScoreList() {
         }
       </div>
       <div class="score-card-meta">
-        <h3>${displayNameForScore(name)}</h3>
+        <h3>${escapeHtml(displayNameForScore(name))}</h3>
         <small>${name}</small>
       </div>
     </div>
@@ -1951,8 +1970,8 @@ function renderGuestDashboard() {
         </div>
         <div class="score-card-meta">
           <div class="guest-demo-kicker">${completed ? 'Completed demo' : (score.primary ? 'Start here' : 'Included demo')}</div>
-          <h3>${score.title}</h3>
-          <small>${score.subtitle}</small>
+          <h3>${escapeHtml(score.title)}</h3>
+          <small>${escapeHtml(score.subtitle)}</small>
         </div>
         <button class="btn ${score.primary ? 'btn-primary' : 'btn-ghost'} guest-card-action" type="button" onclick="event.stopPropagation(); openScore('${score.name}')">
           ${completed ? 'Replay demo' : score.cta}
@@ -1982,7 +2001,7 @@ function renderPlayPieceList() {
         class="play-piece-item${active ? ' active' : ''}"
         ${active ? 'disabled' : ''}
         onclick="openScore('${name}')">
-        <span class="play-piece-title">${displayNameForScore(name)}</span>
+        <span class="play-piece-title">${escapeHtml(displayNameForScore(name))}</span>
         <span class="play-piece-slug">${name}</span>
       </button>
     `;
@@ -2487,7 +2506,11 @@ function setPieceLoadingUI(loading, name = '') {
     fallback.style.display = 'none';
     fallback.innerHTML = '';
   }
-  if (keyboardLoading) keyboardLoading.style.display = loading ? 'grid' : 'none';
+  if (keyboardLoading) {
+    keyboardLoading.classList.remove('error');
+    keyboardLoading.textContent = 'Loading piece...';
+    keyboardLoading.style.display = loading ? 'grid' : 'none';
+  }
   document.getElementById('progress-fill').style.width = loading ? '0%' : document.getElementById('progress-fill').style.width;
   if (loading) {
     document.getElementById('next-note-display').textContent = '—';
@@ -2495,6 +2518,23 @@ function setPieceLoadingUI(loading, name = '') {
     document.getElementById('tempo-val').textContent = '—';
     updatePracticePanelStatus();
   }
+}
+
+function setPieceErrorUI(name, error) {
+  const placeholder = document.getElementById('sheet-placeholder');
+  const keyboardLoading = document.getElementById('keyboard-loading');
+  const message = readApiErrorMessage(error);
+  if (placeholder) {
+    placeholder.style.display = 'block';
+    placeholder.textContent = `Could not load ${displayNameForScore(name)}. ${message}`;
+  }
+  if (keyboardLoading) {
+    keyboardLoading.classList.add('error');
+    keyboardLoading.textContent = 'Could not load piece';
+    keyboardLoading.style.display = 'grid';
+  }
+  document.getElementById('start-btn').disabled = true;
+  document.getElementById('stop-btn').disabled = true;
 }
 
 async function openScore(name, options = {}) {
@@ -2507,24 +2547,40 @@ async function openScore(name, options = {}) {
   if (state.current?.name !== name) setFingeringJob(null);
   if (reveal) showScreen('play-screen');
   setPieceLoadingUI(true, name);
+  let loaded = false;
 
   try {
     const previousPart = preserveSelectedPart ? (state.selectedPart ?? 0) : 0;
     const previousVariant = preserveSheetVariant ? state.sheetVariant : 'base';
     const data = await fetchScore(name);
+    const prefs = loadScorePreferences(data.name);
     state.current = data;
+    state.scoreMeta[data.name] = {
+      ...(state.scoreMeta[data.name] || {}),
+      title: data.title || displayNameForScore(data.name),
+    };
     renderGuestTips(data);
     state.finishedPlayback = false;
     state.practiceRightHand = null;
     state.practiceLeftHand = null;
     const parts = data.parts || [];
+    const preferredPart = preserveSelectedPart
+      ? previousPart
+      : Number.isInteger(prefs.selectedPart)
+        ? prefs.selectedPart
+        : 0;
     state.selectedPart = parts.length
-      ? Math.max(0, Math.min(previousPart, parts.length - 1))
+      ? Math.max(0, Math.min(preferredPart, parts.length - 1))
       : 0;
-    state.partInstruments = {};
+    state.partInstruments = prefs.partInstruments && typeof prefs.partInstruments === 'object'
+      ? { ...prefs.partInstruments }
+      : {};
     state.sheetVariant = (previousVariant === 'fingered' && data.fingering?.applied) ? 'fingered' : 'base';
     _stopMic();
-    setInputMode('keyboard');
+    if (Number.isFinite(Number(prefs.bpm))) {
+      const bpmInput = document.getElementById('bpm-input');
+      if (bpmInput) bpmInput.value = String(Math.max(20, Math.min(300, Number(prefs.bpm))));
+    }
 
     document.getElementById('progress-fill').style.width = '0%';
     document.getElementById('next-note-display').textContent = '—';
@@ -2540,7 +2596,7 @@ async function openScore(name, options = {}) {
     const btns   = document.getElementById('part-buttons');
     if (parts.length > 0) {
       btns.innerHTML = parts.map((p, i) => {
-        const instr = p.instrument || 'piano';
+        const instr = getInstrumentForPart(i);
         return `<div class="part-row" id="part-row-${i}">
           <button class="part-btn${i === state.selectedPart ? ' selected' : ''}"
                   onclick="selectPart(${i})" id="part-btn-${i}">
@@ -2558,6 +2614,8 @@ async function openScore(name, options = {}) {
       picker.style.display = 'none';
     }
 
+    setInputMode(prefs.inputMode === 'mic' ? 'mic' : 'keyboard', { persist: false });
+    if (prefs.keyboardLayoutMode) applyKeyboardLayoutMode(prefs.keyboardLayoutMode);
     buildKeyboard(getRightHand());
     updateNextKey(getRightHand(), 0);
     renderNoteHighway();
@@ -2573,8 +2631,15 @@ async function openScore(name, options = {}) {
     document.getElementById('start-btn').textContent = '▶ Start';
     document.getElementById('start-btn').classList.add('btn-primary');
     document.getElementById('stop-btn').disabled  = true;
-  } finally {
+    markScoreOpened(name);
+    loaded = true;
+  } catch (error) {
+    console.warn(`Could not open score "${name}":`, error);
     setPieceLoadingUI(false);
+    setPieceErrorUI(name, error);
+    return;
+  } finally {
+    if (loaded) setPieceLoadingUI(false);
   }
 }
 
@@ -2610,6 +2675,7 @@ async function selectPart(idx) {
   renderNoteHighway();
   syncExpectedMicNote();
   preloadCurrentScoreInstruments();
+  saveCurrentScorePreferences({ selectedPart: idx });
 }
 
 function getInstrumentForPart(idx) {
@@ -2625,6 +2691,7 @@ async function changeInstrument(partIdx, instrument) {
   }
   if (state.current?.guest) {
     preloadCurrentScoreInstruments();
+    saveCurrentScorePreferences();
     return;
   }
   try {
@@ -2635,6 +2702,7 @@ async function changeInstrument(partIdx, instrument) {
     });
   } catch { /* non-critical — change is applied in-memory either way */ }
   preloadCurrentScoreInstruments();
+  saveCurrentScorePreferences();
 }
 
 function getRightHandRaw() {
@@ -2652,21 +2720,25 @@ function getLeftHandRaw() {
   const parts = state.current?.parts;
   if (!parts || parts.length === 0) return state.current?.left_hand || [];
   const idx = state.selectedPart ?? 0;
-  // Merge all parts except the selected one
+
   const left = [];
-  parts.forEach((p, i) => { if (i !== idx) left.push(...p.notes); });
-  left.sort((a, b) => a[1] - b[1]);
-  return left.map((event) => {
-    const merged = [eventPitches(event), event[1], eventDuration(event)];
-    const pedalRelease = eventPedalRelease(event);
-    if (pedalRelease !== null) merged.push(pedalRelease);
-    const metadata = Array.isArray(event) ? event.slice(4).filter((item) => item !== undefined && item !== null) : [];
-    if (metadata.length) {
-      if (merged.length === 3) merged.push(null);
-      merged.push(...metadata);
-    }
-    return merged;
+  parts.forEach((p, i) => {
+    if (i === idx) return;
+    const instrument = getInstrumentForPart(i);
+    (p.notes || []).forEach((event) => {
+      const merged = [eventPitches(event), event[1], eventDuration(event)];
+      const pedalRelease = eventPedalRelease(event);
+      if (pedalRelease !== null) merged.push(pedalRelease);
+      const metadata = Array.isArray(event)
+        ? event.slice(4).filter((item) => item !== undefined && item !== null)
+        : [];
+      metadata.forEach((item) => appendEventMetadata(merged, item));
+      appendEventMetadata(merged, { type: 'instrument', instrument });
+      left.push(merged);
+    });
   });
+  left.sort((a, b) => a[1] - b[1]);
+  return left;
 }
 
 function getLeftHand() {
@@ -2733,8 +2805,9 @@ function updateSheetHighlight(beat) {
 
   const measureEl = _sheetMeasureEls[idx];
   if (!measureEl) return;
-  const doc = measureEl.ownerDocument;
-  const overlayRoot = doc.querySelector('svg.definition-scale g.page-margin') || measureEl.parentNode;
+  const overlayRoot = measureEl.closest('g.page-margin')
+    || measureEl.closest('svg.definition-scale')?.querySelector('g.page-margin')
+    || measureEl.parentNode;
   if (!overlayRoot) return;
 
   const bbox = measureEl.getBBox();
@@ -3358,7 +3431,8 @@ function updatePracticePanelStatus() {
   }
 }
 
-function setInputMode(mode) {
+function setInputMode(mode, options = {}) {
+  const persist = options.persist !== false;
   _inputMode = mode;
   document.getElementById('tab-keyboard').classList.toggle('active', mode === 'keyboard');
   document.getElementById('tab-mic').classList.toggle('active', mode === 'mic');
@@ -3370,6 +3444,7 @@ function setInputMode(mode) {
     _stopMic();
   }
   updatePracticePanelStatus();
+  if (persist) saveCurrentScorePreferences({ inputMode: mode });
 }
 
 function onNoiseGateChange(val) {
@@ -3644,6 +3719,39 @@ async function deleteScore(e, name) {
   await loadScoreList();
 }
 
+async function renameScore(e, name) {
+  e.stopPropagation();
+  if (state.guestMode || isGuestScoreName(name)) {
+    showGuestUpgradeToast('Create a free account to rename and manage your own library.');
+    return;
+  }
+  const currentTitle = state.scoreMeta?.[name]?.title || formatName(name);
+  const title = prompt('Rename piece', currentTitle)?.trim();
+  if (!title || title === currentTitle) return;
+  if (_appConfig.auth_enabled && !_authUser) {
+    setAuthStatus('Sign in first to rename pieces.', 'error');
+    return;
+  }
+  try {
+    if (_appConfig.auth_enabled) {
+      const result = await api(`/api/scores/${encodeURIComponent(name)}/title`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      });
+      state.scoreMeta[name] = { ...(state.scoreMeta[name] || {}), title: result.title || title };
+    } else {
+      state.scoreMeta[name] = { ...(state.scoreMeta[name] || {}), title };
+    }
+    await loadScoreList();
+    renderPlayPieceList();
+  } catch (error) {
+    alert(`Rename failed: ${readApiErrorMessage(error)}`);
+  }
+}
+
+window.renameScore = renameScore;
+
 // ── Add piece modal ───────────────────────────────────────────────────────────
 let _searchTimer = null;
 
@@ -3662,6 +3770,7 @@ function openAddModal() {
   document.getElementById('import-files').value = '';
   updateImportFileLabel([]);
   setImportStatus('No files selected.');
+  setImportProgress({ visible: false });
   document.getElementById('search-results').innerHTML =
     '<p class="search-hint">Type to search the built-in music library (535 pieces).</p>';
   setTimeout(() => document.getElementById('corpus-search').focus(), 50);
@@ -3727,7 +3836,7 @@ if (_keyboardSectionEl) {
       if (_sampleSamplers[sampledInstrument]) {
         playNote(midi, 0.6, instrument, { duration: 0.45 });
       } else {
-        playSynthNote(midi, 0.6, 'piano', { duration: 0.45 });
+        playSynthNote(midi, 0.6, instrument, { duration: 0.45 });
       }
       highlightKey(`refkey-${midi}`, true);
       setTimeout(() => highlightKey(`refkey-${midi}`, false), 180);
@@ -3751,6 +3860,50 @@ function setImportStatus(message, tone = 'muted') {
     : tone === 'success'
       ? 'var(--success)'
       : 'var(--muted)';
+}
+
+function setImportProgress({ visible = true, progress = 0, message = '', active = false } = {}) {
+  const container = document.getElementById('import-progress');
+  const fill = document.getElementById('import-progress-fill');
+  const label = document.getElementById('import-progress-label');
+  const percent = document.getElementById('import-progress-percent');
+  if (!container || !fill || !label || !percent) return;
+  const normalized = Math.max(0, Math.min(100, Number(progress) || 0));
+  container.hidden = !visible;
+  container.classList.toggle('active', !!active);
+  fill.style.width = `${normalized}%`;
+  label.textContent = message || 'Working…';
+  percent.textContent = `${Math.round(normalized)}%`;
+}
+
+async function waitForImportJob(jobId) {
+  let lastProgress = 0;
+  let lastMessage = '';
+  let messageStartedAt = Date.now();
+  while (true) {
+    const job = await api(`/api/import/jobs/${encodeURIComponent(jobId)}`);
+    lastProgress = Math.max(lastProgress, Number(job.progress) || 0);
+    const baseMessage = job.message || 'Importing…';
+    if (baseMessage !== lastMessage) {
+      lastMessage = baseMessage;
+      messageStartedAt = Date.now();
+    }
+    const elapsedSeconds = Math.floor((Date.now() - messageStartedAt) / 1000);
+    const message = elapsedSeconds >= 8 && (job.status === 'queued' || job.status === 'running')
+      ? `${baseMessage} (${elapsedSeconds}s)`
+      : baseMessage;
+    setImportProgress({
+      visible: true,
+      progress: lastProgress,
+      message,
+      active: job.status === 'queued' || job.status === 'running',
+    });
+    setImportStatus(message);
+
+    if (job.status === 'completed') return job.result;
+    if (job.status === 'failed') throw new Error(job.error || job.message || 'Import failed');
+    await new Promise((resolve) => setTimeout(resolve, 900));
+  }
 }
 
 function updateImportFileLabel(files) {
@@ -3838,7 +3991,7 @@ async function importScoreFiles() {
   const files = [...(fileInput?.files || [])];
 
   if (!files.length) {
-    setImportStatus('Choose a MusicXML/MuseScore file, one PDF, or one/more page images first.', 'error');
+    setImportStatus('Choose a MusicXML/MuseScore file, LilyPond .ily files, a .zip bundle, one PDF, or page images first.', 'error');
     return;
   }
 
@@ -3848,19 +4001,41 @@ async function importScoreFiles() {
 
   button.disabled = true;
   const isDirectScore = files.length === 1 && /\.(xml|mxl|musicxml|mscx|mscz)$/i.test(files[0].name || '');
-  setImportStatus(isDirectScore ? 'Importing score file and building the score…' : 'Running Audiveris and converting the score…');
+  const isLilyPond = files.every((file) => /\.(ily|ly)$/i.test(file.name || ''))
+    || (files.length === 1 && /\.zip$/i.test(files[0].name || ''));
+  setImportStatus(
+    isLilyPond
+      ? 'Combining LilyPond parts and building the score…'
+      : isDirectScore
+        ? 'Importing score file and building the score…'
+        : 'Running Audiveris and converting the score…'
+  );
+  setImportProgress({
+    visible: true,
+    progress: isDirectScore || isLilyPond ? 18 : 8,
+    message: isLilyPond
+      ? 'Uploading LilyPond parts…'
+      : isDirectScore
+        ? 'Uploading score file…'
+        : 'Uploading for Audiveris…',
+    active: true,
+  });
 
   try {
-    const response = await fetch('/api/import', { method: 'POST', body: form });
+    const response = await fetch('/api/import/start', { method: 'POST', body: form });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
       throw new Error(payload.detail || 'Import failed');
     }
-    addScoreToLibrary(payload.name);
-    setImportStatus(`Imported ${formatName(payload.name)}.`, 'success');
+    const result = await waitForImportJob(payload.id);
+    if (!result?.name) throw new Error('Import completed without a score name.');
+    addScoreToLibrary(result.name);
+    setImportProgress({ visible: true, progress: 100, message: 'Import complete', active: false });
+    setImportStatus(`Imported ${formatName(result.name)}.`, 'success');
     await loadScoreList();
     setTimeout(() => closeAddModal(), 3000);
   } catch (error) {
+    setImportProgress({ visible: true, progress: 100, message: error.message || 'Import failed.', active: false });
     setImportStatus(error.message || 'Import failed.', 'error');
   } finally {
     button.disabled = false;
@@ -3877,12 +4052,14 @@ function initImportControls() {
     updateImportFileLabel(files);
     if (!files.length) {
       setImportStatus('No files selected.');
+      setImportProgress({ visible: false });
       return;
     }
     const label = files.length === 1
       ? files[0].name
       : `${files.length} files selected`;
     setImportStatus(label);
+    setImportProgress({ visible: false });
   });
 
   dropzone?.addEventListener('click', () => importFiles?.click());
@@ -3928,6 +4105,7 @@ function initTempoControls() {
     buildKeyboard(getRightHand());
     updateNextKey(getRightHand(), 0);
     renderNoteHighway();
+    saveCurrentScorePreferences();
   });
 }
 

@@ -13,8 +13,10 @@ Endpoints:
 import os
 import re
 import shlex
+import shutil
 import tempfile
 import subprocess
+import zipfile
 import hashlib
 import hmac
 import secrets
@@ -31,7 +33,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel
 from src.env import load_local_env
-from src.convert_score import convert_score_source, render_html, slugify_score_name
+from src.convert_score import convert_lilypond_parts_to_musicxml, convert_score_source, render_html, slugify_score_name
 from src.fingering import apply_auto_fingering, normalize_fingering_state, stack_fingering_chord_numbers_in_html
 from src.paths import get_static_dir
 from src.storage import create_score_store, SupabaseScoreStore, _score_row_to_payload
@@ -75,13 +77,18 @@ ALLOWED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 ALLOWED_PDF_SUFFIXES = {".pdf"}
 ALLOWED_MUSICXML_SUFFIXES = {".xml", ".mxl", ".musicxml"}
 ALLOWED_MUSESCORE_SUFFIXES = {".mscx", ".mscz"}
+ALLOWED_LILYPOND_SUFFIXES = {".ily", ".ly"}
+ALLOWED_ZIP_SUFFIXES = {".zip"}
 ALLOWED_DIRECT_SCORE_SUFFIXES = ALLOWED_MUSICXML_SUFFIXES | ALLOWED_MUSESCORE_SUFFIXES
+LILYPOND_HELPER_STEMS = {"global", "music", "midi"}
 _score_store = create_score_store()
 SESSION_COOKIE_NAME = "accompy_session"
 SESSION_DAYS = 30
 _fingering_jobs: dict[str, dict] = {}
 _active_fingering_jobs: dict[tuple[str, str], str] = {}
 _fingering_jobs_lock = threading.Lock()
+_import_jobs: dict[str, dict] = {}
+_import_jobs_lock = threading.Lock()
 _session_user_cache: dict[str, tuple[float, dict | None]] = {}
 _session_user_cache_lock = threading.Lock()
 SESSION_USER_CACHE_TTL_SEC = 60
@@ -359,6 +366,60 @@ def _finish_fingering_job(job_id: str):
         _active_fingering_jobs.pop((job["user_id"], job["score_name"]), None)
 
 
+def _import_job_public_payload(job: dict) -> dict:
+    return {
+        "id": job["id"],
+        "status": job["status"],
+        "progress": job["progress"],
+        "message": job["message"],
+        "error": job.get("error"),
+        "result": job.get("result"),
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+    }
+
+
+def _create_import_job(user_id: str, score_name: str, upload_paths: list[Path], work_dir: Path, output_dir: Path) -> dict:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    job_id = secrets.token_urlsafe(12)
+    job = {
+        "id": job_id,
+        "user_id": user_id,
+        "score_name": score_name,
+        "upload_paths": [str(path) for path in upload_paths],
+        "work_dir": str(work_dir),
+        "output_dir": str(output_dir),
+        "status": "queued",
+        "progress": 4,
+        "message": "Queued import",
+        "error": None,
+        "result": None,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+    with _import_jobs_lock:
+        _import_jobs[job_id] = job
+    return dict(job)
+
+
+def _update_import_job(job_id: str, **updates) -> dict | None:
+    with _import_jobs_lock:
+        job = _import_jobs.get(job_id)
+        if not job:
+            return None
+        job.update(updates)
+        job["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return dict(job)
+
+
+def _load_import_job_for_user(user_id: str, job_id: str) -> dict:
+    with _import_jobs_lock:
+        job = _import_jobs.get(job_id)
+        if not job or job.get("user_id") != user_id:
+            raise HTTPException(status_code=404, detail="Import job not found.")
+        return dict(job)
+
+
 def _run_fingering_job(job_id: str):
     job = _fingering_jobs.get(job_id)
     if not job:
@@ -456,20 +517,70 @@ def combine_images_to_pdf(image_paths: list[Path], out_path: Path) -> Path:
     return out_path
 
 
-def prepare_omr_input(upload_paths: list[Path], work_dir: Path) -> Path:
+def extract_lilypond_zip(zip_path: Path, work_dir: Path) -> list[Path]:
+    lily_dir = work_dir / "lilypond"
+    lily_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            lily_members = [
+                member for member in zf.infolist()
+                if not member.is_dir()
+                and not member.filename.startswith("__MACOSX/")
+                and Path(member.filename).suffix.lower() == ".ily"
+            ]
+            members = lily_members or [
+                member for member in zf.infolist()
+                if not member.is_dir()
+                and not member.filename.startswith("__MACOSX/")
+                and Path(member.filename).suffix.lower() == ".ly"
+            ]
+            if not members:
+                raise HTTPException(status_code=400, detail="The .zip file must contain one or more .ily or .ly files.")
+
+            extracted = []
+            part_members = [
+                member for member in members
+                if Path(member.filename).stem.lower() not in LILYPOND_HELPER_STEMS
+            ] or members
+            for index, member in enumerate(sorted(part_members, key=lambda item: item.filename.lower())):
+                safe_stem = score_name_from_input(Path(member.filename).stem or f"part_{index + 1}")
+                dest = lily_dir / f"{index:02d}_{safe_stem}{Path(member.filename).suffix.lower()}"
+                with zf.open(member) as src, open(dest, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                extracted.append(dest)
+            return extracted
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail="The uploaded .zip file could not be read.") from exc
+
+
+def prepare_omr_input(upload_paths: list[Path], work_dir: Path) -> Path | list[Path]:
     suffixes = {path.suffix.lower() for path in upload_paths}
     if suffixes & ALLOWED_DIRECT_SCORE_SUFFIXES:
         if len(upload_paths) != 1 or not suffixes <= ALLOWED_DIRECT_SCORE_SUFFIXES:
-            raise HTTPException(status_code=400, detail="Upload one MusicXML/MuseScore file, one PDF, or one/more image files.")
+            raise HTTPException(status_code=400, detail="Upload one MusicXML/MuseScore file, LilyPond file set, .zip bundle, one PDF, or one/more image files.")
         return upload_paths[0]
+
+    if suffixes & ALLOWED_LILYPOND_SUFFIXES:
+        if not suffixes <= ALLOWED_LILYPOND_SUFFIXES:
+            raise HTTPException(status_code=400, detail="Upload only .ily/.ly files when importing LilyPond parts.")
+        part_paths = [
+            path for path in upload_paths
+            if path.stem.lower() not in LILYPOND_HELPER_STEMS
+        ] or upload_paths
+        return sorted(part_paths)
+
+    if suffixes & ALLOWED_ZIP_SUFFIXES:
+        if len(upload_paths) != 1 or not suffixes <= ALLOWED_ZIP_SUFFIXES:
+            raise HTTPException(status_code=400, detail="Upload one .zip bundle, not a mix of .zip and other files.")
+        return extract_lilypond_zip(upload_paths[0], work_dir)
 
     if suffixes & ALLOWED_PDF_SUFFIXES:
         if len(upload_paths) != 1 or not suffixes <= ALLOWED_PDF_SUFFIXES:
-            raise HTTPException(status_code=400, detail="Upload one MusicXML/MuseScore file, one PDF, or one/more image files.")
+            raise HTTPException(status_code=400, detail="Upload one MusicXML/MuseScore file, LilyPond file set, .zip bundle, one PDF, or one/more image files.")
         return upload_paths[0]
 
     if not suffixes or not suffixes <= ALLOWED_IMAGE_SUFFIXES:
-        raise HTTPException(status_code=400, detail="Supported uploads are MusicXML (.xml, .mxl, .musicxml), MuseScore (.mscx, .mscz), PDF, PNG, JPG, and JPEG.")
+        raise HTTPException(status_code=400, detail="Supported uploads are MusicXML (.xml, .mxl, .musicxml), MuseScore (.mscx, .mscz), LilyPond (.ily/.ly or .zip), PDF, PNG, JPG, and JPEG.")
 
     return combine_images_to_pdf(upload_paths, work_dir / "input.pdf")
 
@@ -512,6 +623,110 @@ def find_musicxml_output(output_dir: Path) -> Path:
             continue
         return candidate
     raise HTTPException(status_code=500, detail="Audiveris completed but no MusicXML output was found.")
+
+
+def convert_and_save_import(
+    user_id: str,
+    score_name: str,
+    upload_paths: list[Path],
+    work_dir: Path,
+    output_dir: Path,
+    progress_callback=None,
+) -> dict:
+    def progress(percent: int, message: str):
+        if progress_callback:
+            progress_callback(max(0, min(99, int(percent))), message)
+
+    progress(10, "Preparing upload")
+    import_input = prepare_omr_input(upload_paths, work_dir)
+    if isinstance(import_input, list):
+        progress(34, f"Preparing {len(import_input)} LilyPond parts")
+        musicxml_path = Path(convert_lilypond_parts_to_musicxml(
+            [str(path) for path in import_input],
+            str(output_dir),
+            score_name,
+            progress_callback=progress,
+        ))
+    elif import_input.suffix.lower() in ALLOWED_DIRECT_SCORE_SUFFIXES:
+        progress(34, "Reading uploaded score")
+        musicxml_path = import_input
+    else:
+        progress(20, "Starting Audiveris")
+        run_audiveris(import_input, output_dir)
+        progress(68, "Collecting Audiveris output")
+        musicxml_path = find_musicxml_output(output_dir)
+
+    try:
+        progress(76, "Building NotePilot score")
+        result = convert_score_source(str(musicxml_path), name=score_name, out_dir=str(output_dir))
+    except Exception as exc:
+        suffix = musicxml_path.suffix.lower()
+        source_label = "uploaded MusicXML/MuseScore file" if suffix in ALLOWED_DIRECT_SCORE_SUFFIXES else "Audiveris output"
+        raise HTTPException(status_code=400, detail=f"Could not convert {source_label}: {exc}") from exc
+
+    progress(92, "Saving imported score")
+    saved = _score_store.save_score(user_id, {
+        "name": result["name"],
+        "title": result["title"],
+        "parts": result["parts"],
+        "measure_beats": result["measure_beats"],
+        "sheet_html": Path(result["out_html"]).read_text(encoding="utf-8") if os.path.exists(result["out_html"]) else "",
+        "musicxml_source": Path(result["render_source_path"]).read_text(encoding="utf-8") if os.path.exists(result["render_source_path"]) else "",
+        "fingered_sheet_html": "",
+        "fingered_musicxml_source": "",
+        "fingering": result.get("fingering") or {},
+        "source_type": "upload",
+    })
+    return {
+        "name": saved["name"],
+        "parts": len(saved["parts"]),
+        "total_notes": sum(len(part.get("notes", [])) for part in saved["parts"]),
+        "has_sheet": saved["has_sheet"],
+    }
+
+
+def _run_import_job(job_id: str):
+    with _import_jobs_lock:
+        job = dict(_import_jobs.get(job_id) or {})
+    if not job:
+        return
+
+    work_dir = Path(job["work_dir"])
+    try:
+        _update_import_job(job_id, status="running", progress=8, message="Preparing upload")
+        result = convert_and_save_import(
+            job["user_id"],
+            job["score_name"],
+            [Path(path) for path in job["upload_paths"]],
+            work_dir,
+            Path(job["output_dir"]),
+            progress_callback=lambda percent, message: _update_import_job(
+                job_id,
+                status="running",
+                progress=percent,
+                message=message,
+            ),
+        )
+        _update_import_job(
+            job_id,
+            status="completed",
+            progress=100,
+            message="Import complete",
+            result=result,
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        _update_import_job(job_id, status="failed", progress=100, message=detail, error=detail)
+    except Exception as exc:
+        _update_import_job(
+            job_id,
+            status="failed",
+            progress=100,
+            message="Import failed.",
+            error=str(exc),
+        )
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @app.get("/api/corpus/search")
@@ -725,6 +940,10 @@ class InstrumentUpdate(BaseModel):
     instrument: str
 
 
+class ScoreTitleUpdate(BaseModel):
+    title: str
+
+
 @app.patch("/api/scores/{name}/instrument")
 def update_instrument(name: str, req: InstrumentUpdate, request: Request):
     """Persist an instrument change for a part in the stored score."""
@@ -745,6 +964,18 @@ def update_instrument(name: str, req: InstrumentUpdate, request: Request):
         "source_type": score.get("source_type") or "converted",
     })
     return {"updated": True}
+
+
+@app.patch("/api/scores/{name}/title")
+def update_score_title(name: str, req: ScoreTitleUpdate, request: Request):
+    user_id = require_supabase_user_id(request, "score renaming")
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title cannot be empty.")
+    if len(title) > 120:
+        raise HTTPException(status_code=400, detail="Title must be 120 characters or fewer.")
+    renamed = _score_store.rename_score_title(user_id, name, title)
+    return {"name": renamed["name"], "title": renamed["title"]}
 
 
 @app.delete("/api/scores/{name}")
@@ -869,39 +1100,42 @@ async def import_score(
         output_dir.mkdir(parents=True, exist_ok=True)
 
         upload_paths = [await save_uploaded_file(upload, uploads_dir, idx) for idx, upload in enumerate(files)]
-        import_input = prepare_omr_input(upload_paths, work_dir)
-        if import_input.suffix.lower() in ALLOWED_DIRECT_SCORE_SUFFIXES:
-            musicxml_path = import_input
-        else:
-            run_audiveris(import_input, output_dir)
-            musicxml_path = find_musicxml_output(output_dir)
-
-        try:
-            result = convert_score_source(str(musicxml_path), name=score_name, out_dir=str(output_dir))
-        except Exception as exc:
-            suffix = musicxml_path.suffix.lower()
-            source_label = "uploaded MusicXML/MuseScore file" if suffix in ALLOWED_DIRECT_SCORE_SUFFIXES else "Audiveris output"
-            raise HTTPException(status_code=400, detail=f"Could not convert {source_label}: {exc}") from exc
-
         user_id = require_supabase_user_id(request, "score saving")
-        saved = _score_store.save_score(user_id, {
-            "name": result["name"],
-            "title": result["title"],
-            "parts": result["parts"],
-            "measure_beats": result["measure_beats"],
-            "sheet_html": Path(result["out_html"]).read_text(encoding="utf-8") if os.path.exists(result["out_html"]) else "",
-            "musicxml_source": Path(result["render_source_path"]).read_text(encoding="utf-8") if os.path.exists(result["render_source_path"]) else "",
-            "fingered_sheet_html": "",
-            "fingered_musicxml_source": "",
-            "fingering": result.get("fingering") or {},
-            "source_type": "upload",
-        })
-    return {
-        "name": saved["name"],
-        "parts": len(saved["parts"]),
-        "total_notes": sum(len(part.get("notes", [])) for part in saved["parts"]),
-        "has_sheet": saved["has_sheet"],
-    }
+        return convert_and_save_import(user_id, score_name, upload_paths, work_dir, output_dir)
+
+
+@app.post("/api/import/start")
+async def start_import_score(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    name: str = Form(""),
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded.")
+
+    user_id = require_supabase_user_id(request, "score saving")
+    score_name = score_name_from_input(name or Path(files[0].filename or "imported_score").stem)
+    work_dir = Path(tempfile.mkdtemp(prefix="accompy_import_"))
+    uploads_dir = work_dir / "uploads"
+    output_dir = work_dir / "audiveris"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        upload_paths = [await save_uploaded_file(upload, uploads_dir, idx) for idx, upload in enumerate(files)]
+        job = _create_import_job(user_id, score_name, upload_paths, work_dir, output_dir)
+        thread = threading.Thread(target=_run_import_job, args=(job["id"],), daemon=True)
+        thread.start()
+        return _import_job_public_payload(job)
+    except Exception:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise
+
+
+@app.get("/api/import/jobs/{job_id}")
+def get_import_job(job_id: str, request: Request):
+    user_id = require_supabase_user_id(request, "score importing")
+    return _import_job_public_payload(_load_import_job_for_user(user_id, job_id))
 
 
 # Serve static files and fallback to index.html for browser-routed score URLs.

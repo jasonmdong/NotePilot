@@ -88,7 +88,7 @@ class SupabaseScoreStore:
             "GET",
             "scores",
             params={
-                "select": "slug,sheet_html,score_data",
+                "select": "slug,title,sheet_html,score_data,created_at",
                 "user_id": f"eq.{user_id}",
                 "order": "created_at.desc",
             },
@@ -99,6 +99,8 @@ class SupabaseScoreStore:
             "items": [
                 {
                     "name": row["slug"],
+                    "title": row.get("title") or row["slug"],
+                    "created_at": row.get("created_at"),
                     "has_sheet": "<svg" in (row.get("sheet_html") or "") or bool((row.get("score_data") or {}).get("musicxml_source")),
                 }
                 for row in rows if row.get("slug")
@@ -182,6 +184,22 @@ class SupabaseScoreStore:
             },
             headers={"Prefer": "return=minimal"},
         )
+
+    def rename_score_title(self, user_id: str, name: str, title: str):
+        result = self._request(
+            "PATCH",
+            "scores",
+            params={
+                "user_id": f"eq.{user_id}",
+                "slug": f"eq.{name}",
+                "select": "id,user_id,slug,title,source_type,score_data,measure_beats,sheet_html,created_at",
+            },
+            json_body={"title": title},
+            headers={"Prefer": "return=representation"},
+        ) or []
+        if not result:
+            raise HTTPException(status_code=404, detail=f"Score '{name}' not found")
+        return _score_row_to_payload(result[0])
 
     def get_app_user_by_username(self, username: str):
         rows = self._request(

@@ -103,20 +103,29 @@
       <div class="upload-divider"></div>
 
       <div class="modal-section">
-        <h4>Import PDF, images, or MusicXML</h4>
-        <p class="modal-copy">Upload one PDF, a set of page screenshots, or a MusicXML/MuseScore file. PDF/images go through Audiveris first; MusicXML and MuseScore files import directly.</p>
+        <h4>Import PDF, images, MusicXML, or LilyPond</h4>
+        <p class="modal-copy">Upload one PDF, page screenshots, a MusicXML/MuseScore file, multiple LilyPond .ily part files, or a .zip of .ily parts.</p>
       </div>
       <div class="upload-form">
         <input id="import-name" type="text" placeholder="Piece name (optional)">
-        <input id="import-files" class="file-input-hidden" type="file" accept=".pdf,.png,.jpg,.jpeg,.xml,.mxl,.musicxml,.mscx,.mscz,image/png,image/jpeg,application/pdf,text/xml,application/xml" multiple>
+        <input id="import-files" class="file-input-hidden" type="file" accept=".pdf,.png,.jpg,.jpeg,.xml,.mxl,.musicxml,.mscx,.mscz,.ily,.ly,.zip,image/png,image/jpeg,application/pdf,text/xml,application/xml,application/zip" multiple>
         <div id="import-dropzone" class="file-dropzone" role="button" tabindex="0" aria-label="Choose files or drag files here">
           <div class="file-dropzone-title">Choose files</div>
-          <div class="file-dropzone-copy">or drag PDF, image, MusicXML, or MuseScore files here</div>
+          <div class="file-dropzone-copy">or drag PDF, image, MusicXML, MuseScore, .ily, or .zip files here</div>
           <div id="import-file-label" class="file-dropzone-selection">No files selected</div>
         </div>
         <div class="upload-actions">
-          <button id="import-btn" type="button" class="btn btn-primary" onclick="importScoreFiles()">Import</button>
+          <button id="import-btn" type="button" class="btn btn-primary">Import</button>
           <span id="import-status" class="import-status">No files selected.</span>
+        </div>
+        <div id="import-progress" class="import-progress" hidden>
+          <div class="import-progress-track">
+            <div id="import-progress-fill" class="import-progress-fill" style="width:0%"></div>
+          </div>
+          <div class="import-progress-meta">
+            <span id="import-progress-label">Waiting to import…</span>
+            <span id="import-progress-percent">0%</span>
+          </div>
         </div>
       </div>
     </div>
