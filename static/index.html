@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>NotePilot</title>
-  <link rel="stylesheet" href="/style.css?v=20260519-sheet-display-segment">
+  <link rel="stylesheet" href="/style.css?v=20260519-home-routes">
 </head>
 <body>
 
@@ -20,6 +20,8 @@
       <span class="brand-word">Note<span>Pilot</span></span>
     </button>
     <div class="top-nav-actions">
+      <button id="nav-library-btn" class="btn btn-ghost nav-library-btn" type="button" onclick="goToLibrary()" style="display:none">Library</button>
+      <button id="nav-signin-btn" class="btn btn-primary nav-signin-btn" type="button" onclick="goToSignIn()">Sign in</button>
       <div id="nav-auth-user" class="nav-auth-user" style="display:none">
         <span id="nav-auth-username"></span>
         <button class="btn btn-ghost nav-logout-btn" type="button" onclick="signOut()">Log out</button>
@@ -50,34 +52,85 @@
       </div>
     </div>
   </div>
-  <div id="guest-banner" class="guest-banner" style="display:none">
-    <div>
-      <strong>Guest Mode</strong>
-      <span>Changes are saved only on this device.</span>
+  <main id="landing-page" class="landing-page">
+    <section class="landing-hero">
+      <div class="landing-copy">
+        <p class="landing-kicker">Practice with purpose</p>
+        <h1>Sheet music that listens while you play.</h1>
+        <p>NotePilot follows your tempo, plays the accompaniment around you, and turns practice into a focused session instead of a static score.</p>
+        <div class="landing-actions">
+          <button class="btn btn-primary" type="button" onclick="goToSignIn()">Sign in</button>
+          <button class="btn btn-ghost" type="button" onclick="continueAsGuest()">Try the demo</button>
+        </div>
+      </div>
+      <div class="landing-score-preview" aria-hidden="true">
+        <div class="preview-staff">
+          <span></span><span></span><span></span><span></span><span></span>
+          <i style="--x:12%;--y:45%"></i>
+          <i style="--x:26%;--y:30%"></i>
+          <i style="--x:42%;--y:55%"></i>
+          <i style="--x:58%;--y:38%"></i>
+          <i style="--x:73%;--y:24%"></i>
+          <b></b>
+        </div>
+        <div class="preview-keyboard">
+          <span></span><span></span><span></span><span class="active"></span><span></span><span></span><span></span>
+        </div>
+      </div>
+    </section>
+    <div class="landing-feature-grid">
+      <article>
+        <h3>Adaptive accompaniment</h3>
+        <p>The backing part can slow down when you need room, then return to the target tempo.</p>
+      </article>
+      <article>
+        <h3>Interactive scores</h3>
+        <p>Open sheet music, pick parts, mark practice notes, and jump around by measure.</p>
+      </article>
+      <article>
+        <h3>Keyboard or microphone</h3>
+        <p>Practice with a computer keyboard, MIDI piano, or microphone input.</p>
+      </article>
     </div>
-    <div class="guest-banner-actions">
-      <button class="btn btn-ghost" type="button" onclick="resetGuestDemo()">Reset Demo</button>
-      <button class="btn btn-primary" type="button" onclick="showCreateAccountPrompt('Create a free account to save your own pieces and progress.')">Create Account</button>
+    <footer class="landing-footer">
+      <span>Open source project</span>
+      <a class="github-footer-link" href="https://github.com/jasonmdong/accompy" target="_blank" rel="noreferrer" aria-label="View NotePilot on GitHub">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="M12 .5a12 12 0 0 0-3.8 23.4c.6.1.8-.2.8-.6v-2c-3.3.7-4-1.4-4-1.4-.5-1.3-1.3-1.7-1.3-1.7-1.1-.8.1-.8.1-.8 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.6-.3-5.4-1.3-5.4-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2a11.2 11.2 0 0 1 6 0C17.7 4.9 18.7 5.2 18.7 5.2c.6 1.7.2 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.4 5.9.4.4.8 1.1.8 2.2v3.6c0 .4.2.7.8.6A12 12 0 0 0 12 .5z"></path>
+        </svg>
+      </a>
+    </footer>
+  </main>
+  <main id="library-page" class="library-page">
+    <div id="guest-banner" class="guest-banner" style="display:none">
+      <div>
+        <strong>Guest Mode</strong>
+        <span>Changes are saved only on this device.</span>
+      </div>
+      <div class="guest-banner-actions">
+        <button class="btn btn-ghost" type="button" onclick="resetGuestDemo()">Reset Demo</button>
+        <button class="btn btn-primary" type="button" onclick="showCreateAccountPrompt('Create a free account to save your own pieces and progress.')">Create Account</button>
+      </div>
     </div>
-  </div>
-  <div class="library-header">
-    <div>
-      <h2 id="library-title">Your Library</h2>
-      <p id="library-subtitle">Choose a piece, set your part, and let NotePilot follow your tempo.</p>
+    <div class="library-header">
+      <div>
+        <h2 id="library-title">Your Library</h2>
+        <p id="library-subtitle">Choose a piece, set your part, and let NotePilot follow your tempo.</p>
+      </div>
+      <button id="add-piece-btn" class="btn btn-primary" onclick="openAddModal()">+ Add piece</button>
     </div>
-    <button id="add-piece-btn" class="btn btn-primary" onclick="openAddModal()">+ Add piece</button>
-  </div>
-  <div class="score-grid-toolbar">
-    <label for="score-grid-columns">Preview columns</label>
-    <select id="score-grid-columns" class="instr-select" onchange="setScoreGridColumns(this.value)">
-      <option value="2">2</option>
-      <option value="3" selected>3</option>
-      <option value="4">4</option>
-      <option value="5">5</option>
-      <option value="6">6</option>
-    </select>
-  </div>
-  <div id="score-grid" class="score-grid"></div>
+    <div class="score-grid-toolbar">
+      <label for="score-grid-columns">Preview columns</label>
+      <select id="score-grid-columns" class="instr-select" onchange="setScoreGridColumns(this.value)">
+        <option value="2">2</option>
+        <option value="3" selected>3</option>
+        <option value="4">4</option>
+        <option value="5">5</option>
+        <option value="6">6</option>
+      </select>
+    </div>
+    <div id="score-grid" class="score-grid"></div>
+  </main>
 </div>
 
 <!-- ── Add piece modal ── -->
@@ -508,6 +561,6 @@
 <script src="https://unpkg.com/tone@15.1.22/build/Tone.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.9.2/build/opensheetmusicdisplay.min.js"></script>
 <script src="/pitch.js"></script>
-<script src="/app.js?v=20260519-sheet-display-segment"></script>
+<script src="/app.js?v=20260519-home-routes"></script>
 </body>
 </html>

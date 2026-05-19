@@ -917,6 +917,7 @@ let state = {
   finishedPlayback: false,
   guestMode:        false,
   playbackVolumes:  { accompaniment: 0.5, solo: 2 },
+  listRoute:        'landing',
   sheetView: { zoom: 1.0, rotation: 0 },
   sheetSource: null, // { name, variant, hasSheet, musicXml }
   sheetVariant: 'base',
@@ -1138,31 +1139,99 @@ function showScreen(id) {
   if (header) header.hidden = id === 'play-screen';
 }
 
-function routeScoreName() {
-  const raw = window.location.pathname.replace(/^\/+|\/+$/g, '');
-  if (!raw || raw.startsWith('api/') || raw === 'auth/callback') return null;
+function decodePathSegment(value) {
   try {
-    return decodeURIComponent(raw);
+    return decodeURIComponent(value);
   } catch {
-    return raw;
+    return value;
   }
 }
 
-function updateScoreUrl(name, replace = false) {
-  const nextPath = name ? `/${encodeURIComponent(name)}` : '/';
-  if (window.location.pathname === nextPath) return;
+function accountUrlSlug() {
+  if (state.guestMode) return 'guest';
+  const raw = _authUser?.username || _authUser?.email || _authUser?.id || 'me';
+  const base = String(raw).split('@')[0] || 'me';
+  const slug = base.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return slug || 'me';
+}
+
+function homeUrlPath() {
+  return `/${encodeURIComponent(accountUrlSlug())}/home`;
+}
+
+function scoreUrlPath(name) {
+  return `/${encodeURIComponent(accountUrlSlug())}/${encodeURIComponent(name)}`;
+}
+
+function parseAppRoute() {
+  const raw = window.location.pathname.replace(/^\/+|\/+$/g, '');
+  if (!raw || raw.startsWith('api/')) return { mode: 'landing' };
+  const segments = raw.split('/').filter(Boolean).map(decodePathSegment);
+  const first = (segments[0] || '').toLowerCase();
+  const second = (segments[1] || '').toLowerCase();
+  if (first === 'auth' && second === 'callback') return { mode: 'signin' };
+  if (first === 'signin' || first === 'login') return { mode: 'signin' };
+  if (first === 'home') return { mode: 'home' };
+  if (second === 'home') return { mode: 'home', account: segments[0] };
+  if (segments.length >= 2) return { mode: 'score', account: segments[0], score: segments.slice(1).join('/') };
+  return { mode: 'score', score: segments[0] };
+}
+
+function routeScoreName() {
+  const route = parseAppRoute();
+  return route.mode === 'score' ? route.score : null;
+}
+
+function writeUrl(nextPath, replace = false, statePayload = {}) {
+  if (window.location.pathname === nextPath && !window.location.search && !window.location.hash) return;
   const method = replace ? 'replaceState' : 'pushState';
-  window.history[method]({ score: name || null }, '', nextPath);
+  window.history[method](statePayload, '', nextPath);
+}
+
+function updateScoreUrl(name, replace = false) {
+  writeUrl(name ? scoreUrlPath(name) : '/', replace, { score: name || null });
+}
+
+function updateHomeUrl(replace = false) {
+  writeUrl(homeUrlPath(), replace, { route: 'home' });
+}
+
+function setListRoute(mode) {
+  state.listRoute = mode;
+  showScreen('list-screen');
+  document.body.classList.toggle('landing-route', mode === 'landing');
+  document.body.classList.toggle('signin-route', mode === 'signin');
+  document.body.classList.toggle('library-route', mode === 'library');
+  updateAuthUI();
 }
 
 function goHome() {
   if (state.playing) stopPlaying();
-  updateScoreUrl(null);
-  showScreen('list-screen');
-  loadScoreList().catch((error) => console.warn('Could not refresh score list:', error));
+  writeUrl('/', false, { route: 'landing' });
+  setListRoute('landing');
+}
+
+function goToSignIn(replace = false) {
+  if (state.playing) stopPlaying();
+  writeUrl('/signin', replace, { route: 'signin' });
+  setListRoute('signin');
+  setTimeout(() => document.getElementById('auth-email')?.focus(), 50);
+}
+
+async function goToLibrary(replace = false) {
+  if (state.playing) stopPlaying();
+  if (_appConfig.auth_enabled && !_authUser && !state.guestMode) {
+    goToSignIn(replace);
+    return;
+  }
+  updateHomeUrl(replace);
+  setListRoute('library');
+  await loadScoreList().catch((error) => console.warn('Could not refresh score list:', error));
 }
 
 window.goHome = goHome;
+window.goToSignIn = goToSignIn;
+window.goToLibrary = goToLibrary;
 
 function applyPlaySidebarCollapsed(collapsed) {
   const shell = document.querySelector('#play-screen .play-shell');
@@ -1203,13 +1272,27 @@ function updateAuthUI() {
   const playGuestBanner = document.getElementById('play-guest-banner');
   const navAuthUser = document.getElementById('nav-auth-user');
   const navUsername = document.getElementById('nav-auth-username');
+  const navSignIn = document.getElementById('nav-signin-btn');
+  const navLibrary = document.getElementById('nav-library-btn');
   const googleBtn = document.getElementById('google-signin-btn');
   const googleDivider = document.getElementById('google-auth-divider');
   const libraryTitle = document.getElementById('library-title');
   const librarySubtitle = document.getElementById('library-subtitle');
   if (!panel || !loggedOut || !addPieceBtn) return;
   updateSidebarAccountUI();
+  const isLoggedIn = !!_authUser;
+  const canUseLibrary = state.guestMode || isLoggedIn || !_appConfig.auth_enabled;
+  const showSignInRoute = state.listRoute === 'signin' && !canUseLibrary;
   document.body.classList.toggle('guest-mode', state.guestMode);
+  document.body.classList.toggle('auth-mode', showSignInRoute);
+  panel.style.display = showSignInRoute ? 'grid' : 'none';
+  loggedOut.style.display = showSignInRoute ? 'block' : 'none';
+  if (navSignIn) {
+    navSignIn.style.display = (!isLoggedIn && !state.guestMode && _appConfig.auth_enabled && state.listRoute !== 'signin') ? 'inline-flex' : 'none';
+  }
+  if (navLibrary) {
+    navLibrary.style.display = (canUseLibrary && state.listRoute !== 'library') ? 'inline-flex' : 'none';
+  }
   if (guestBanner) guestBanner.style.display = state.guestMode ? 'flex' : 'none';
   if (playGuestBanner) playGuestBanner.style.display = state.guestMode ? 'block' : 'none';
   if (libraryTitle) libraryTitle.textContent = state.guestMode ? 'Demo Library' : 'Your Library';
@@ -1220,9 +1303,6 @@ function updateAuthUI() {
   }
 
   if (state.guestMode) {
-    document.body.classList.remove('auth-mode');
-    panel.style.display = 'none';
-    loggedOut.style.display = 'none';
     addPieceBtn.disabled = false;
     addPieceBtn.textContent = '+ Add piece';
     if (navAuthUser) navAuthUser.style.display = 'none';
@@ -1232,8 +1312,6 @@ function updateAuthUI() {
   }
 
   if (!_appConfig.auth_enabled) {
-    document.body.classList.remove('auth-mode');
-    panel.style.display = 'none';
     if (guestBanner) guestBanner.style.display = 'none';
     if (playGuestBanner) playGuestBanner.style.display = 'none';
     if (navAuthUser) navAuthUser.style.display = 'none';
@@ -1242,10 +1320,6 @@ function updateAuthUI() {
     return;
   }
 
-  const isLoggedIn = !!_authUser;
-  document.body.classList.toggle('auth-mode', !isLoggedIn);
-  panel.style.display = isLoggedIn ? 'none' : 'block';
-  loggedOut.style.display = isLoggedIn ? 'none' : 'block';
   if (googleBtn) googleBtn.style.display = _appConfig.google_auth_enabled ? 'inline-flex' : 'none';
   if (googleDivider) googleDivider.style.display = _appConfig.google_auth_enabled ? 'flex' : 'none';
   addPieceBtn.disabled = !isLoggedIn;
@@ -1315,9 +1389,7 @@ function sidebarAccountAction() {
     signOut();
     return;
   }
-  showScreen('list-screen');
-  updateScoreUrl(null, true);
-  updateAuthUI();
+  goToSignIn(true);
 }
 
 document.addEventListener('click', (event) => {
@@ -1338,7 +1410,7 @@ async function completeGoogleRedirectIfNeeded() {
   const query = new URLSearchParams(window.location.search);
   const oauthError = params.get('error_description') || query.get('error_description') || params.get('error') || query.get('error');
   if (oauthError) {
-    window.history.replaceState({ score: null }, '', '/');
+    window.history.replaceState({ route: 'signin' }, '', '/signin');
     setAuthStatus(`Google sign-in failed: ${oauthError}`, 'error');
     return;
   }
@@ -1352,9 +1424,15 @@ async function completeGoogleRedirectIfNeeded() {
       body: JSON.stringify({ access_token: accessToken }),
     });
     _authUser = result.user || null;
-    window.history.replaceState({ score: null }, '', '/');
+    if (_authUser) {
+      state.guestMode = false;
+      localStorage.removeItem(GUEST_MODE_KEY);
+      window.history.replaceState({ route: 'home' }, '', homeUrlPath());
+    } else {
+      window.history.replaceState({ route: 'signin' }, '', '/signin');
+    }
   } catch (error) {
-    window.history.replaceState({ score: null }, '', '/');
+    window.history.replaceState({ route: 'signin' }, '', '/signin');
     setAuthStatus(error.message || 'Google sign-in failed.', 'error');
   }
 }
@@ -1393,9 +1471,8 @@ async function signIn() {
     _authUser = result.user || null;
     state.guestMode = false;
     localStorage.removeItem(GUEST_MODE_KEY);
-    await loadScoreList();
     updateAuthUI();
-    await openRouteFromLocation({ replace: true });
+    await goToLibrary(true);
     setAuthStatus('Signed in.', 'success');
   } catch (error) {
     setAuthStatus(error.message || 'Sign in failed.', 'error');
@@ -1417,9 +1494,8 @@ async function signUp() {
     _authUser = result.user || null;
     state.guestMode = false;
     localStorage.removeItem(GUEST_MODE_KEY);
-    await loadScoreList();
     updateAuthUI();
-    await openRouteFromLocation({ replace: true });
+    await goToLibrary(true);
     setAuthStatus('Account created.', 'success');
   } catch (error) {
     setAuthStatus(error.message || 'Sign up failed.', 'error');
@@ -1450,8 +1526,8 @@ async function signOut() {
   state.sheetVariant = 'base';
   updateAuthUI();
   renderPlayPieceList();
-  updateScoreUrl(null, true);
-  showScreen('list-screen');
+  writeUrl('/', true, { route: 'landing' });
+  setListRoute('landing');
 }
 
 async function continueAsGuest() {
@@ -1464,9 +1540,7 @@ async function continueAsGuest() {
   localStorage.setItem(GUEST_MODE_KEY, '1');
   hideUpgradeToast();
   updateAuthUI();
-  updateScoreUrl(null, true);
-  showScreen('list-screen');
-  await loadScoreList();
+  await goToLibrary(true);
 }
 
 async function resetGuestDemo() {
@@ -1480,9 +1554,7 @@ function showCreateAccountPrompt(message = 'Create a free account to save your o
   state.guestMode = false;
   localStorage.removeItem(GUEST_MODE_KEY);
   hideUpgradeToast();
-  updateScoreUrl(null, true);
-  updateAuthUI();
-  showScreen('list-screen');
+  goToSignIn(true);
   setAuthStatus(message, 'success');
   setTimeout(() => document.getElementById('auth-email')?.focus(), 50);
 }
@@ -3080,10 +3152,36 @@ async function openScore(name, options = {}) {
 }
 
 async function openRouteFromLocation(options = {}) {
-  const name = routeScoreName();
-  if (!name) {
-    if (options.replace) updateScoreUrl(null, true);
-    showScreen('list-screen');
+  const route = parseAppRoute();
+  if (route.mode === 'landing') {
+    if (state.guestMode || _authUser || !_appConfig.auth_enabled) {
+      await goToLibrary(!!options.replace);
+    } else {
+      if (options.replace) writeUrl('/', true, { route: 'landing' });
+      setListRoute('landing');
+    }
+    return;
+  }
+  if (route.mode === 'signin') {
+    if (state.guestMode || _authUser) {
+      await goToLibrary(true);
+    } else {
+      if (options.replace) writeUrl('/signin', true, { route: 'signin' });
+      setListRoute('signin');
+    }
+    return;
+  }
+  if (route.mode === 'home') {
+    if (_appConfig.auth_enabled && !_authUser && !state.guestMode) {
+      goToSignIn(true);
+      return;
+    }
+    await goToLibrary(!!options.replace);
+    return;
+  }
+  const name = route.score;
+  if (_appConfig.auth_enabled && !_authUser && !state.guestMode) {
+    goToSignIn(true);
     return;
   }
   showScreen('play-screen');
@@ -3092,7 +3190,7 @@ async function openRouteFromLocation(options = {}) {
     if (options.replace) updateScoreUrl(name, true);
   } catch (error) {
     console.warn(`Could not open score from route "${name}":`, error);
-    showScreen('list-screen');
+    await goToLibrary(true);
   }
 }
 
@@ -4656,16 +4754,14 @@ initHorizontalSplitters();
 onNoiseGateChange(document.getElementById('noise-gate')?.value || '1');
 setLatencyCompensation(localStorage.getItem('accompy_latency_comp_ms') || '0');
 initAppConfig().then(async () => {
-  if (state.guestMode || !_appConfig.auth_enabled || _authUser) {
-    const hasRoute = !!routeScoreName();
-    if (hasRoute) {
-      await Promise.all([
-        loadScoreList(),
-        openRouteFromLocation({ replace: true }),
-      ]);
-    } else {
-      await loadScoreList();
-      await openRouteFromLocation({ replace: true });
-    }
+  const route = parseAppRoute();
+  const canUseLibrary = state.guestMode || !_appConfig.auth_enabled || _authUser;
+  if (canUseLibrary && route.mode === 'score') {
+    await Promise.all([
+      loadScoreList(),
+      openRouteFromLocation({ replace: true }),
+    ]);
+  } else {
+    await openRouteFromLocation({ replace: true });
   }
 });
