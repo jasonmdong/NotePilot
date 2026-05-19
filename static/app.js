@@ -489,6 +489,33 @@ function eventIndexAtOrAfterBeat(events, beat) {
   return idx >= 0 ? idx : list.length;
 }
 
+function extendedSoloRestThresholdBeats(referenceBeat = 0) {
+  const starts = (state.current?.measure_beats || [])
+    .map((beat) => Number(beat))
+    .filter((beat) => Number.isFinite(beat))
+    .sort((a, b) => a - b);
+  if (starts.length >= 5) {
+    let measureIndex = 0;
+    const beat = Math.max(0, Number(referenceBeat) || 0);
+    for (let i = 0; i < starts.length; i++) {
+      if (starts[i] <= beat + 0.001) measureIndex = i;
+      else break;
+    }
+    if (Number.isFinite(starts[measureIndex + 4])) {
+      return Math.max(1, starts[measureIndex + 4] - starts[measureIndex]);
+    }
+    const spans = starts
+      .slice(1)
+      .map((start, i) => start - starts[i])
+      .filter((span) => span > 0);
+    if (spans.length) {
+      spans.sort((a, b) => a - b);
+      return Math.max(1, spans[Math.floor(spans.length / 2)] * 4);
+    }
+  }
+  return 16;
+}
+
 function tremoloTargetSeconds(marks) {
   const normalized = Math.max(1, Math.min(4, Number.parseInt(marks, 10) || 3));
   return ({ 1: 0.18, 2: 0.125, 3: 0.085, 4: 0.065 })[normalized] || 0.085;
@@ -682,8 +709,9 @@ class Tracker {
     return this._smoothedBps;
   }
 
-  accompanimentBps() {
+  accompanimentBps(options = {}) {
     const detected = this.bps();
+    if (options.adaptiveTempo) return detected;
     const target = this._targetBps || this._defaultBps || detected;
     if (!Number.isFinite(target) || target <= 0) return detected;
 
@@ -723,6 +751,7 @@ class Accompanist {
     this._instruments = leftInstruments;
     this.rhBeats   = [...new Set(rightHand.map(n=>n[1]))].sort((a,b)=>a-b);
     this._bps      = initialBps;
+    this._targetBps = initialBps;
     this._syncBeat = 0;
     this._syncTime = null;   // null = waiting for first RH note
     this._nextSync = this.rhBeats[0] ?? Infinity;
@@ -760,7 +789,7 @@ class Accompanist {
   }
 
   resume(beat, bps) {
-    this._bps = bps;
+    this._bps = this.tempoForBeat(beat, bps);
     this._syncBeat = beat;
     this._syncTime = performance.now() / 1000 - _accompanimentLatencyCompSec;
     this._nextSync = this.rhBeats.find((b) => b > beat + 0.01) ?? Infinity;
@@ -769,12 +798,12 @@ class Accompanist {
   }
 
   onRhNote(beat, bps) {
-    this._bps      = bps;
+    this._nextSync = this.rhBeats.find(b => b > beat + 0.01) ?? Infinity;
+    this._bps      = this.tempoForBeat(beat, bps);
     this._syncBeat = beat;
     // Bias the accompaniment clock slightly ahead to compensate for browser
     // output latency that is still audible even with wired MIDI input.
     this._syncTime = performance.now() / 1000 - _accompanimentLatencyCompSec;
-    this._nextSync = this.rhBeats.find(b => b > beat + 0.01) ?? Infinity;
     // Skip LH events now in the past
     while (this._lhIdx < this.events.length && this.events[this._lhIdx][1] < beat - 0.08)
       this._lhIdx++;
@@ -791,11 +820,48 @@ class Accompanist {
 
   seek(beat, bps = this._bps) {
     const targetBeat = Math.max(0, Number(beat) || 0);
-    this._bps = Number.isFinite(bps) && bps > 0 ? bps : this._bps;
+    this._bps = this.tempoForBeat(targetBeat, bps);
     this._syncBeat = targetBeat;
     this._syncTime = performance.now() / 1000 - _accompanimentLatencyCompSec;
     this._nextSync = this.rhBeats.find((b) => b > targetBeat + 0.01) ?? Infinity;
     this._lhIdx = eventIndexAtOrAfterBeat(this.events, targetBeat - 0.01);
+  }
+
+  tempoForBeat(beat, bps = this._bps) {
+    const fallback = Number.isFinite(bps) && bps > 0 ? bps : this._bps;
+    if (state.adaptiveTempo) return fallback;
+    return this.hasExtendedSoloGapAt(beat) ? this._targetBps : fallback;
+  }
+
+  hasExtendedSoloGapAt(beat) {
+    const targetBeat = Math.max(0, Number(beat) || 0);
+    const gap = this._soloGapAroundBeat(targetBeat);
+    if (!gap) return false;
+    const threshold = extendedSoloRestThresholdBeats(gap.start);
+    return gap.end - gap.start >= threshold - 0.001;
+  }
+
+  _soloGapAroundBeat(beat) {
+    const beats = this.rhBeats;
+    if (!beats.length) return null;
+    let previous = 0;
+    for (const rhBeat of beats) {
+      if (rhBeat <= beat + 0.01) previous = rhBeat;
+      else break;
+    }
+    const next = beats.find((rhBeat) => rhBeat > beat + 0.01);
+    const end = Number.isFinite(next) ? next : this._scoreEndBeat();
+    return Number.isFinite(end) && end > previous + 0.01 ? { start: previous, end } : null;
+  }
+
+  _scoreEndBeat() {
+    const lastRhBeat = this.rhBeats[this.rhBeats.length - 1] ?? 0;
+    const lastAccompanimentBeat = this.events.reduce((latest, event) => {
+      const start = Number(event?.[1]);
+      if (!Number.isFinite(start)) return latest;
+      return Math.max(latest, start + eventDuration(event, 0));
+    }, 0);
+    return Math.max(lastRhBeat, lastAccompanimentBeat);
   }
 
   _tick() {
@@ -847,12 +913,14 @@ let state = {
   pausedBeat:       0,
   pausedBps:        1,
   practiceStartBeat: 0,
+  adaptiveTempo: false,
   finishedPlayback: false,
   guestMode:        false,
   playbackVolumes:  { accompaniment: 0.5, solo: 2 },
   sheetView: { zoom: 1.0, rotation: 0 },
   sheetSource: null, // { name, variant, hasSheet, musicXml }
   sheetVariant: 'base',
+  sheetDisplayMode: 'full',
 };
 
 let _noteHighwayRaf = null;
@@ -878,6 +946,8 @@ const GUEST_PROGRESS_KEY = 'notepilot_guest_progress_v1';
 const SCORE_RECENTS_KEY = 'notepilot_recent_scores_v1';
 const SCORE_PREFS_KEY = 'notepilot_score_preferences_v1';
 const PLAYBACK_VOLUME_KEY = 'notepilot_playback_volume_v3';
+const SHEET_DISPLAY_MODE_KEY = 'notepilot_sheet_display_mode_v1';
+const ADAPTIVE_TEMPO_KEY = 'notepilot_adaptive_tempo_v1';
 const PRACTICE_SPLITTER_SIZE = 12;
 const LAYOUT_SPLITTER_SIZE = 12;
 let _appConfig = { supabase_enabled: false, auth_enabled: false };
@@ -1950,6 +2020,27 @@ function initLatencyControls() {
   slider.dataset.bound = '1';
 }
 
+function setAdaptiveTempo(enabled, persist = true) {
+  state.adaptiveTempo = !!enabled;
+  const toggle = document.getElementById('adaptive-tempo-toggle');
+  if (toggle) {
+    toggle.classList.toggle('active', state.adaptiveTempo);
+    toggle.setAttribute('aria-pressed', state.adaptiveTempo ? 'true' : 'false');
+    toggle.title = state.adaptiveTempo
+      ? 'Adaptive tempo is on.'
+      : 'Adaptive tempo is off. Long solo rests return to starting tempo.';
+  }
+  if (persist) localStorage.setItem(ADAPTIVE_TEMPO_KEY, state.adaptiveTempo ? '1' : '0');
+}
+
+function toggleAdaptiveTempo() {
+  setAdaptiveTempo(!state.adaptiveTempo);
+}
+
+function initAdaptiveTempoControl() {
+  setAdaptiveTempo(localStorage.getItem(ADAPTIVE_TEMPO_KEY) === '1', false);
+}
+
 function normalizePlaybackVolume(value, fallback = 1) {
   const numeric = Number.parseFloat(value);
   if (!Number.isFinite(numeric)) return fallback;
@@ -2382,6 +2473,86 @@ function currentSheetAssets() {
   };
 }
 
+function selectedSheetPartIndices() {
+  if (state.sheetDisplayMode !== 'selected') return [];
+  const parts = state.current?.parts || [];
+  if (!parts.length) return [];
+  return selectedPartIndices();
+}
+
+function selectedSheetPartsParam() {
+  return selectedSheetPartIndices().join(',');
+}
+
+function updateSheetDisplayModeUI() {
+  const selectedMode = state.sheetDisplayMode === 'selected';
+  const fullBtn = document.getElementById('sheet-display-full');
+  const selectedBtn = document.getElementById('sheet-display-selected');
+  if (fullBtn) {
+    fullBtn.classList.toggle('active', !selectedMode);
+    fullBtn.setAttribute('aria-pressed', selectedMode ? 'false' : 'true');
+    fullBtn.title = 'Show the complete score.';
+  }
+  if (selectedBtn) {
+    selectedBtn.classList.toggle('active', selectedMode);
+    selectedBtn.setAttribute('aria-pressed', selectedMode ? 'true' : 'false');
+    selectedBtn.title = 'Show only the selected practice parts.';
+  }
+}
+
+async function setSheetDisplayMode(mode) {
+  const normalized = mode === 'selected' ? 'selected' : 'full';
+  if (state.sheetDisplayMode === normalized) {
+    updateSheetDisplayModeUI();
+    return;
+  }
+  state.sheetDisplayMode = normalized;
+  localStorage.setItem(SHEET_DISPLAY_MODE_KEY, state.sheetDisplayMode);
+  updateSheetDisplayModeUI();
+  await renderScoreSheet();
+}
+
+async function toggleSheetDisplayMode() {
+  await setSheetDisplayMode(state.sheetDisplayMode === 'selected' ? 'full' : 'selected');
+}
+
+function initSheetDisplayMode() {
+  const saved = localStorage.getItem(SHEET_DISPLAY_MODE_KEY);
+  state.sheetDisplayMode = saved === 'selected' ? 'selected' : 'full';
+  updateSheetDisplayModeUI();
+}
+
+function filterMusicXmlParts(xmlText, partIndices) {
+  if (!xmlText || !partIndices?.length) return xmlText;
+  try {
+    const doc = new DOMParser().parseFromString(xmlText, 'application/xml');
+    if (doc.querySelector('parsererror')) return xmlText;
+    const partList = [...doc.documentElement.children].find((child) => child.localName === 'part-list');
+    if (!partList) return xmlText;
+    const scoreParts = [...partList.children].filter((child) => child.localName === 'score-part');
+    const selectedIds = new Set(
+      partIndices
+        .map((idx) => scoreParts[idx]?.getAttribute('id'))
+        .filter(Boolean)
+    );
+    if (!selectedIds.size) return xmlText;
+    [...partList.children].forEach((child) => {
+      if (child.localName === 'score-part' && !selectedIds.has(child.getAttribute('id'))) {
+        partList.removeChild(child);
+      }
+    });
+    [...doc.documentElement.children].forEach((child) => {
+      if (child.localName === 'part' && !selectedIds.has(child.getAttribute('id'))) {
+        doc.documentElement.removeChild(child);
+      }
+    });
+    return new XMLSerializer().serializeToString(doc);
+  } catch (error) {
+    console.warn('Could not filter MusicXML parts:', error);
+    return xmlText;
+  }
+}
+
 function updateFingeringProgressUI() {
   const root = document.getElementById('sheet-fingering-progress');
   const fill = document.getElementById('sheet-fingering-progress-fill');
@@ -2538,6 +2709,8 @@ async function renderScoreSheet() {
   const placeholder = document.getElementById('sheet-placeholder');
   const musicXmlFallback = document.getElementById('sheet-musicxml-fallback');
   const assets = currentSheetAssets();
+  const sheetPartIndices = selectedSheetPartIndices();
+  const sheetPartsParam = sheetPartIndices.join(',');
 
   musicXmlFallback.style.display = 'none';
   musicXmlFallback.innerHTML = '';
@@ -2554,9 +2727,11 @@ async function renderScoreSheet() {
     variant: assets.variant,
     hasSheet: assets.hasSheet,
     musicXml: assets.musicXml,
+    parts: sheetPartIndices,
   };
   updateSheetFingeringStatus();
   updateFingeringProgressUI();
+  updateSheetDisplayModeUI();
 
   const finalizeFrame = () => {
     if (renderSeq !== _sheetRenderSeq || state.current?.name !== scoreName) return;
@@ -2564,8 +2739,45 @@ async function renderScoreSheet() {
     initializeSheetHighlighting();
   };
 
+  if (sheetPartIndices.length && assets.hasSheet && !data.guest) {
+    const query = new URLSearchParams({
+      variant: assets.variant,
+      v: String(renderSeq),
+      parts: sheetPartsParam,
+    });
+    const sheetUrl = `/api/scores/${encodeURIComponent(data.name)}/sheet?${query.toString()}`;
+    try {
+      const resp = await fetch(sheetUrl, { cache: 'no-store' });
+      if (!resp.ok) throw new Error(await resp.text());
+      const html = await resp.text();
+      if (renderSeq !== _sheetRenderSeq || state.current?.name !== scoreName) return;
+      if (!html.includes('<svg')) throw new Error('Selected part rendering returned no SVG.');
+      frame.addEventListener('load', finalizeFrame, { once: true });
+      frame.removeAttribute('src');
+      frame.srcdoc = html;
+      frame.style.display = 'block';
+      placeholder.style.display = 'none';
+      requestAnimationFrame(finalizeFrame);
+      return;
+    } catch (error) {
+      console.warn(`Selected sheet render failed for ${data.name}`, error);
+      if (renderSeq !== _sheetRenderSeq || state.current?.name !== scoreName) return;
+      frame.srcdoc = '';
+      frame.removeAttribute('src');
+      placeholder.style.display = 'block';
+      placeholder.textContent = 'Selected-parts sheet view is unavailable for this score. Use Full to see the original sheet.';
+      clearSheetHighlight();
+      return;
+    }
+  }
+
   if (assets.hasSheet && !(data.guest && assets.musicXml)) {
-    const sheetUrl = `/api/scores/${encodeURIComponent(data.name)}/sheet?variant=${encodeURIComponent(assets.variant)}&v=${encodeURIComponent(renderSeq)}`;
+    const query = new URLSearchParams({
+      variant: assets.variant,
+      v: String(renderSeq),
+    });
+    if (sheetPartsParam) query.set('parts', sheetPartsParam);
+    const sheetUrl = `/api/scores/${encodeURIComponent(data.name)}/sheet?${query.toString()}`;
     try {
       if (renderSeq !== _sheetRenderSeq || state.current?.name !== scoreName) return;
       frame.addEventListener('load', finalizeFrame, { once: true });
@@ -2582,8 +2794,11 @@ async function renderScoreSheet() {
   }
 
   frame.srcdoc = '';
-  const renderedFallback = assets.musicXml
-    ? await renderMusicXmlFallback(assets.musicXml)
+  const fallbackXml = assets.musicXml
+    ? filterMusicXmlParts(assets.musicXml, sheetPartIndices)
+    : null;
+  const renderedFallback = fallbackXml
+    ? await renderMusicXmlFallback(fallbackXml)
     : false;
   if (renderSeq !== _sheetRenderSeq || state.current?.name !== scoreName) return;
   placeholder.style.display = 'none';
@@ -2637,8 +2852,10 @@ async function sheetDownload() {
   }
   if (src.hasSheet) {
     try {
+      const query = new URLSearchParams({ variant: src.variant || 'base' });
+      if (Array.isArray(src.parts) && src.parts.length) query.set('parts', src.parts.join(','));
       const resp = await fetch(
-        `/api/scores/${encodeURIComponent(src.name)}/sheet?variant=${encodeURIComponent(src.variant || 'base')}`,
+        `/api/scores/${encodeURIComponent(src.name)}/sheet?${query.toString()}`,
         { cache: 'no-store' }
       );
       if (!resp.ok) throw new Error(await resp.text());
@@ -2896,6 +3113,7 @@ async function selectPart(idx) {
   updateNextKey(getRightHand(), 0);
   renderNoteHighway();
   syncExpectedMicNote();
+  if (state.sheetDisplayMode === 'selected') await renderScoreSheet();
   preloadCurrentScoreInstruments();
   saveCurrentScorePreferences({
     selectedPart: state.selectedPart ?? 0,
@@ -3072,7 +3290,8 @@ function seekPracticeToBeat(beat) {
 
   const rightHand = state.practiceRightHand || getRightHand();
   const position = eventIndexAtOrAfterBeat(rightHand, targetBeat);
-  const bps = Math.max(0.35, state.pausedBps || _noteHighwayBps || state.tracker?.bps?.() || currentBps() || 1);
+  let bps = Math.max(0.35, state.pausedBps || _noteHighwayBps || state.tracker?.bps?.() || currentBps() || 1);
+  bps = state.accompanist?.tempoForBeat?.(targetBeat, bps) ?? bps;
 
   if (state.tracker) state.tracker.seekToBeat(targetBeat);
   if (state.accompanist) {
@@ -3563,7 +3782,7 @@ function togglePausePlaying() {
 
   if (!state.paused) {
     state.pausedBeat = currentGuideBeat(getRightHand());
-    state.pausedBps = _noteHighwayBps || state.tracker?.accompanimentBps?.() || state.tracker?.bps?.() || 1;
+  state.pausedBps = _noteHighwayBps || state.tracker?.accompanimentBps?.({ adaptiveTempo: state.adaptiveTempo }) || state.tracker?.bps?.() || 1;
     state.paused = true;
     state.accompanist?.pause();
     _stopMic();
@@ -3578,7 +3797,7 @@ function togglePausePlaying() {
   state.paused = false;
   _noteHighwayStartBeat = state.pausedBeat ?? 0;
   _noteHighwayStartTime = performance.now() / 1000;
-  _noteHighwayBps = state.pausedBps ?? (state.tracker?.accompanimentBps?.() ?? state.tracker?.bps?.() ?? 1);
+  _noteHighwayBps = state.pausedBps ?? (state.tracker?.accompanimentBps?.({ adaptiveTempo: state.adaptiveTempo }) ?? state.tracker?.bps?.() ?? 1);
   state.accompanist?.resume(_noteHighwayStartBeat, _noteHighwayBps);
   startBtn.textContent = '❚❚ Pause';
   updatePracticePanelStatus();
@@ -3647,7 +3866,8 @@ function stopPlaying(reason = 'stopped') {
 // ── Note handler (called by keyboard and MIDI) ────────────────────────────────
 function advancePracticeClock(beat) {
   const detectedBps = state.tracker.bps();
-  const accompanimentBps = state.tracker.accompanimentBps?.() ?? detectedBps;
+  let accompanimentBps = state.tracker.accompanimentBps?.({ adaptiveTempo: state.adaptiveTempo }) ?? detectedBps;
+  accompanimentBps = state.accompanist?.tempoForBeat?.(beat, accompanimentBps) ?? accompanimentBps;
   _noteHighwayStartBeat = beat;
   _noteHighwayStartTime = performance.now() / 1000;
   _noteHighwayBps = accompanimentBps;
@@ -4404,6 +4624,9 @@ function initImportControls() {
 
 window.importScoreFiles = importScoreFiles;
 window.setPlaybackVolume = setPlaybackVolume;
+window.setSheetDisplayMode = setSheetDisplayMode;
+window.toggleSheetDisplayMode = toggleSheetDisplayMode;
+window.toggleAdaptiveTempo = toggleAdaptiveTempo;
 
 function initTempoControls() {
   const input = document.getElementById('bpm-input');
@@ -4422,7 +4645,9 @@ function initTempoControls() {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 initLatencyControls();
+initAdaptiveTempoControl();
 initPlaybackVolumeControls();
+initSheetDisplayMode();
 initImportControls();
 initTempoControls();
 initKeyboardLayoutToggle();

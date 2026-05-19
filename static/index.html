@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>NotePilot</title>
-  <link rel="stylesheet" href="/style.css?v=20260519-sheet-measure-jump">
+  <link rel="stylesheet" href="/style.css?v=20260519-sheet-display-segment">
 </head>
 <body>
 
@@ -227,6 +227,10 @@
       <div class="sheet-toolbar">
         <button id="sheet-generate-fingering-btn" class="sheet-action-btn" onclick="generateSheetFingering()" style="display:none">Generate fingering</button>
         <button id="sheet-toggle-fingering-btn" class="sheet-action-btn" onclick="toggleSheetFingering()" style="display:none">Show fingering</button>
+        <div class="sheet-display-toggle" aria-label="Sheet display mode">
+          <button id="sheet-display-full" class="sheet-display-btn" onclick="setSheetDisplayMode('full')">Full</button>
+          <button id="sheet-display-selected" class="sheet-display-btn" onclick="setSheetDisplayMode('selected')">Selected</button>
+        </div>
         <button class="sheet-tool-btn" onclick="sheetZoom(-0.1)" title="Zoom out" aria-label="Zoom out">−</button>
         <span id="sheet-zoom-label" class="sheet-zoom-label">100%</span>
         <button class="sheet-tool-btn" onclick="sheetZoom(0.1)" title="Zoom in" aria-label="Zoom in">+</button>
@@ -344,6 +348,23 @@
         <input id="latency-slider" type="range" min="0" max="500" step="10" value="0"
                oninput="setLatencyCompensation(this.value)">
         <span id="latency-value">0 ms</span>
+      </div>
+      <div class="adaptive-tempo-row">
+        <div class="adaptive-tempo-label">
+          <span>Adaptive tempo</span>
+          <div class="help-tip" tabindex="0" aria-label="Adaptive tempo help">
+            ?
+            <div class="help-tip-popup">On: accompaniment keeps following your tempo, even through long solo rests. Off: accompaniment returns to the starting tempo when your part rests for a while.</div>
+          </div>
+        </div>
+        <button
+          id="adaptive-tempo-toggle"
+          class="switch-toggle"
+          type="button"
+          onclick="toggleAdaptiveTempo()"
+          aria-pressed="false">
+          <span></span>
+        </button>
       </div>
       <div class="mixer-controls" aria-label="Playback volume">
         <div class="mixer-header">
@@ -487,6 +508,6 @@
 <script src="https://unpkg.com/tone@15.1.22/build/Tone.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.9.2/build/opensheetmusicdisplay.min.js"></script>
 <script src="/pitch.js"></script>
-<script src="/app.js?v=20260519-sheet-measure-jump"></script>
+<script src="/app.js?v=20260519-sheet-display-segment"></script>
 </body>
 </html>

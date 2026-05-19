@@ -26,6 +26,8 @@ from pathlib import Path
 from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
+from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
 import requests
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Response
 from fastapi.staticfiles import StaticFiles
@@ -255,6 +257,199 @@ def render_sheet_html_from_musicxml_text(
         render_html(str(xml_path), str(html_path), title)
         html = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
         return stack_fingering_chord_numbers_in_html(html) if stack_fingering_chords else html
+
+
+def parse_sheet_part_indices(raw: str | None) -> list[int] | None:
+    if raw is None:
+        return None
+    indices = []
+    for item in str(raw).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            idx = int(item)
+        except ValueError:
+            continue
+        if idx >= 0 and idx not in indices:
+            indices.append(idx)
+    return indices or None
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def filter_musicxml_parts(xml_text: str, part_indices: list[int] | None) -> str:
+    if not part_indices:
+        return xml_text
+    try:
+        root = ET.fromstring(xml_text.encode("utf-8"))
+    except ET.ParseError:
+        return ""
+
+    part_list = next((child for child in list(root) if _xml_local_name(child.tag) == "part-list"), None)
+    if part_list is None:
+        return ""
+
+    score_parts = [child for child in list(part_list) if _xml_local_name(child.tag) == "score-part"]
+    selected_ids = {
+        score_parts[idx].attrib.get("id")
+        for idx in part_indices
+        if 0 <= idx < len(score_parts) and score_parts[idx].attrib.get("id")
+    }
+    if not selected_ids:
+        return ""
+    if len(selected_ids) == len(score_parts):
+        return xml_text
+
+    for child in list(part_list):
+        if _xml_local_name(child.tag) == "score-part" and child.attrib.get("id") not in selected_ids:
+            part_list.remove(child)
+
+    for child in list(root):
+        if _xml_local_name(child.tag) == "part" and child.attrib.get("id") not in selected_ids:
+            root.remove(child)
+
+    return ET.tostring(root, encoding="unicode")
+
+
+def midi_to_musicxml_pitch(midi: int) -> str:
+    steps = [
+        ("C", 0),
+        ("C", 1),
+        ("D", 0),
+        ("D", 1),
+        ("E", 0),
+        ("F", 0),
+        ("F", 1),
+        ("G", 0),
+        ("G", 1),
+        ("A", 0),
+        ("A", 1),
+        ("B", 0),
+    ]
+    midi = int(midi)
+    step, alter = steps[midi % 12]
+    octave = midi // 12 - 1
+    alter_xml = f"<alter>{alter}</alter>" if alter else ""
+    return f"<pitch><step>{step}</step>{alter_xml}<octave>{octave}</octave></pitch>"
+
+
+def event_pitches(event) -> list[int]:
+    if not isinstance(event, list) or not event:
+        return []
+    raw = event[0]
+    pitches = raw if isinstance(raw, list) else [raw]
+    result = []
+    for pitch in pitches:
+        try:
+            result.append(int(pitch))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def synthesize_selected_parts_musicxml(score: dict, part_indices: list[int], title: str) -> str:
+    parts = score.get("parts") or []
+    selected = [
+        (idx, parts[idx])
+        for idx in part_indices
+        if 0 <= idx < len(parts)
+    ]
+    if not selected:
+        return ""
+
+    divisions = 480
+    measure_starts = [
+        float(beat)
+        for beat in (score.get("measure_beats") or [])
+        if isinstance(beat, (int, float))
+    ]
+    max_end = 0.0
+    for _, part in selected:
+        for event in part.get("notes") or []:
+            if not isinstance(event, list) or len(event) < 2:
+                continue
+            beat = float(event[1] or 0)
+            duration = float(event[2] or 1) if len(event) > 2 else 1
+            max_end = max(max_end, beat + max(duration, 0))
+    if not measure_starts:
+        measure_starts = [0.0]
+        while measure_starts[-1] < max_end:
+            measure_starts.append(measure_starts[-1] + 4.0)
+    if len(measure_starts) == 1 or measure_starts[-1] < max_end:
+        span = 4.0
+        if len(measure_starts) >= 2:
+            spans = [b - a for a, b in zip(measure_starts, measure_starts[1:]) if b > a]
+            if spans:
+                span = sorted(spans)[len(spans) // 2]
+        while measure_starts[-1] < max_end:
+            measure_starts.append(measure_starts[-1] + span)
+
+    def duration_xml(beats: float) -> str:
+        duration = max(1, int(round(max(0.0, beats) * divisions)))
+        return f"<duration>{duration}</duration>"
+
+    def rest_xml(beats: float) -> str:
+        if beats <= 0.0001:
+            return ""
+        return f"<note><rest />{duration_xml(beats)}<voice>1</voice></note>"
+
+    part_list_xml = []
+    parts_xml = []
+    for output_idx, (_part_idx, part) in enumerate(selected, start=1):
+        part_id = f"P{output_idx}"
+        part_name = xml_escape(str(part.get("name") or f"Part {output_idx}"))
+        part_list_xml.append(f'<score-part id="{part_id}"><part-name>{part_name}</part-name></score-part>')
+        events = sorted(
+            [event for event in (part.get("notes") or []) if isinstance(event, list) and len(event) >= 2],
+            key=lambda event: float(event[1] or 0),
+        )
+        measures_xml = []
+        for measure_idx, start in enumerate(measure_starts):
+            end = measure_starts[measure_idx + 1] if measure_idx + 1 < len(measure_starts) else max(max_end, start + 4.0)
+            attrs = ""
+            if measure_idx == 0:
+                attrs = (
+                    f"<attributes><divisions>{divisions}</divisions>"
+                    "<key><fifths>0</fifths></key><time><beats>4</beats><beat-type>4</beat-type></time>"
+                    "<clef><sign>G</sign><line>2</line></clef></attributes>"
+                )
+            cursor = start
+            notes_xml = []
+            for event in events:
+                beat = float(event[1] or 0)
+                if beat < start - 0.0001 or beat >= end - 0.0001:
+                    continue
+                if beat > cursor:
+                    notes_xml.append(rest_xml(beat - cursor))
+                event_duration = float(event[2] or 1) if len(event) > 2 else 1
+                clipped_duration = max(0.0, min(event_duration, end - beat))
+                pitches = event_pitches(event)
+                for pitch_idx, pitch in enumerate(pitches):
+                    chord = "<chord />" if pitch_idx else ""
+                    notes_xml.append(
+                        f"<note>{chord}{midi_to_musicxml_pitch(pitch)}"
+                        f"{duration_xml(clipped_duration)}<voice>1</voice></note>"
+                    )
+                cursor = max(cursor, beat + clipped_duration)
+            if cursor < end:
+                notes_xml.append(rest_xml(end - cursor))
+            measures_xml.append(
+                f'<measure number="{measure_idx + 1}">{attrs}{"".join(notes_xml)}</measure>'
+            )
+        parts_xml.append(f'<part id="{part_id}">{"".join(measures_xml)}</part>')
+
+    escaped_title = xml_escape(title or "Selected parts")
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<score-partwise version="3.1">'
+        f"<movement-title>{escaped_title}</movement-title>"
+        f"<part-list>{''.join(part_list_xml)}</part-list>"
+        f"{''.join(parts_xml)}"
+        "</score-partwise>"
+    )
 
 
 def build_fingered_score_variant(score: dict, progress_callback=None) -> tuple[str, str, dict]:
@@ -991,33 +1186,41 @@ def get_score_meta(name: str, request: Request):
 
 
 @app.get("/api/scores/{name}/sheet")
-def get_sheet(name: str, request: Request, variant: str = "base"):
+def get_sheet(name: str, request: Request, variant: str = "base", parts: str | None = None):
     user_id = require_supabase_user_id(request, "sheet loading")
     row = _score_store.load_score_row(user_id, name)
     score = ensure_fingering_state(_score_row_to_payload(row))
     title = score.get("title") or score.get("name") or name
     score_data = row.get("score_data") or {}
+    part_indices = parse_sheet_part_indices(parts)
+    cached_base_html = (row.get("sheet_html") or score.get("sheet_html") or "").strip()
+    cached_fingered_html = (score_data.get("fingered_sheet_html") or "").strip()
+
+    def render_filtered_source(xml_source: str, *, stack_fingering_chords: bool = False) -> str:
+        filtered_source = filter_musicxml_parts(xml_source, part_indices)
+        if not filtered_source:
+            return ""
+        return render_sheet_html_from_musicxml_text(
+            score.get("name") or name,
+            title,
+            filtered_source,
+            stack_fingering_chords=stack_fingering_chords,
+        )
+
     if variant == "fingered":
         html = ""
         if score.get("fingered_musicxml_source"):
-            html = render_sheet_html_from_musicxml_text(
-                score.get("name") or name,
-                title,
+            html = render_filtered_source(
                 score.get("fingered_musicxml_source") or "",
                 stack_fingering_chords=True,
             )
-        if not html or "<svg" not in html:
-            html = (score_data.get("fingered_sheet_html") or "").strip()
-            html = stack_fingering_chord_numbers_in_html(html)
+        if (not html or "<svg" not in html) and not part_indices:
+            html = stack_fingering_chord_numbers_in_html(cached_fingered_html)
     else:
-        html = (row.get("sheet_html") or score.get("sheet_html") or "").strip()
+        html = "" if part_indices else cached_base_html
         if (not html or "<svg" not in html) and score.get("musicxml_source"):
-            html = render_sheet_html_from_musicxml_text(
-                score.get("name") or name,
-                title,
-                score.get("musicxml_source") or "",
-            )
-            if html and "<svg" in html:
+            html = render_filtered_source(score.get("musicxml_source") or "")
+            if html and "<svg" in html and not part_indices:
                 try:
                     _score_store.update_score_sheet_html(user_id, name, html)
                 except Exception as exc:
