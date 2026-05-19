@@ -50,6 +50,8 @@ const INSTRUMENTS = [
   'voice',
 ];
 const TEMPO_PAUSE_IGNORE_SEC = 3;
+const TEMPO_TARGET_TOLERANCE = 0.08;
+const TEMPO_TARGET_HOLD_SEC = 1.35;
 let _accompanimentLatencyCompSec = 0.28;
 const CHORD_MATCH_WINDOW_SEC = 0.5;
 const MIDI_DUPLICATE_NOTE_GUARD_MS = 18;
@@ -138,8 +140,8 @@ function midiToToneNote(midi) {
 }
 
 function currentBps() {
-  if (state.playing && state.tracker) return state.tracker.bps();
   if (state.playing && state.accompanist) return state.accompanist._bps;
+  if (state.playing && state.tracker) return _noteHighwayBps || state.tracker.bps();
   const bpm = parseFloat(document.getElementById('bpm-input')?.value) || 120;
   return bpm / 60;
 }
@@ -445,19 +447,22 @@ function playSynthNote(midi, velocity = 0.6, instrument = 'piano', opts = {}) {
 }
 
 function playNote(midi, velocity = 0.6, instrument = 'piano', opts = {}) {
+  const volume = normalizePlaybackVolume(opts.volume ?? 1, 1);
+  const effectiveVelocity = Math.max(0, Math.min(3, velocity * volume));
+  if (effectiveVelocity <= 0.001) return;
   const sampledInstrument = SAMPLE_ALIAS[instrument] || instrument;
   const sampler = _sampleSamplers[sampledInstrument];
   if (sampler && !opts.preferSynth) {
     const baseDuration = SAMPLE_LIBRARY[sampledInstrument]?.noteDuration ?? 0.45;
     const duration = Math.max(0.12, opts.duration ?? noteDurationSeconds(instrument, baseDuration));
-    sampler.triggerAttackRelease(midiToToneNote(midi), duration, undefined, Math.min(1, velocity));
+    sampler.triggerAttackRelease(midiToToneNote(midi), duration, undefined, Math.min(1, effectiveVelocity));
     if (instrument === 'piano' && opts.pedaled && !opts.suppressPedalResonance) {
-      playPedalResonance([midi], velocity, opts);
+      playPedalResonance([midi], effectiveVelocity, opts);
     }
     return;
   }
   if (isSampleBackedInstrument(instrument)) return;
-  playSynthNote(midi, velocity, instrument, opts);
+  playSynthNote(midi, effectiveVelocity, instrument, opts);
 }
 
 function playChord(pitches, velocity = 0.5, instrument = 'piano', opts = {}) {
@@ -468,13 +473,20 @@ function playChord(pitches, velocity = 0.5, instrument = 'piano', opts = {}) {
     : opts;
   pitches.forEach(p => playNote(p, noteVelocity, instrument, noteOpts));
   if (instrument === 'piano' && opts.pedaled) {
-    playPedalResonance(pitches, velocity, opts);
+    playPedalResonance(pitches, velocity * normalizePlaybackVolume(opts.volume ?? 1, 1), opts);
   }
 }
 
 function eventPitches(event) {
   if (!event) return [];
   return Array.isArray(event[0]) ? event[0] : [event[0]];
+}
+
+function eventIndexAtOrAfterBeat(events, beat) {
+  const target = Math.max(0, Number(beat) || 0);
+  const list = Array.isArray(events) ? events : [];
+  const idx = list.findIndex((event) => Number(event?.[1]) >= target - 0.001);
+  return idx >= 0 ? idx : list.length;
 }
 
 function tremoloTargetSeconds(marks) {
@@ -560,6 +572,10 @@ class Tracker {
     this.timestamps = [];              // [{time, beat}, ...]
     this._defaultBps = initialBps;
     this._smoothedBps = initialBps;
+    this._targetBps = initialBps;
+    this._governedBps = initialBps;
+    this._targetHoldStartedAt = null;
+    this._lastTempoSampleKey = '';
     this._lastAdvanceTime = 0;
     this._pendingChord = new Set();
     this._pendingPosition = -1;
@@ -618,9 +634,30 @@ class Tracker {
     return beat;
   }
 
+  seekToBeat(beat) {
+    const target = Math.max(0, Number(beat) || 0);
+    this.position = eventIndexAtOrAfterBeat(this.score, target);
+    this.timestamps = [];
+    this._smoothedBps = this._defaultBps;
+    this._governedBps = this._targetBps || this._defaultBps;
+    this._targetHoldStartedAt = null;
+    this._lastTempoSampleKey = '';
+    this._lastAdvanceTime = 0;
+    this._pendingChord.clear();
+    this._pendingPosition = -1;
+    this._pendingStartedAt = 0;
+    this._recentNotes = [];
+    this._lastAdvancedPosition = Math.max(-1, this.position - 1);
+  }
+
   bps() {
     const ts = this.timestamps;
     if (ts.length < 2) return this._smoothedBps;
+    const last = ts[ts.length - 1];
+    const sampleKey = `${ts.length}:${last.time.toFixed(4)}:${last.beat}`;
+    if (sampleKey === this._lastTempoSampleKey) return this._smoothedBps;
+    this._lastTempoSampleKey = sampleKey;
+
     const rates = [];
     for (let i = 1; i < ts.length; i++) {
       const dt = ts[i].time - ts[i-1].time;
@@ -645,6 +682,33 @@ class Tracker {
     return this._smoothedBps;
   }
 
+  accompanimentBps() {
+    const detected = this.bps();
+    const target = this._targetBps || this._defaultBps || detected;
+    if (!Number.isFinite(target) || target <= 0) return detected;
+
+    const lower = target * (1 - TEMPO_TARGET_TOLERANCE);
+    const upper = target * (1 + TEMPO_TARGET_TOLERANCE);
+    const now = performance.now() / 1000;
+
+    if (detected > upper) {
+      this._targetHoldStartedAt = now;
+      this._governedBps = target;
+      return this._governedBps;
+    }
+
+    if (detected >= lower) {
+      if (this._targetHoldStartedAt === null) this._targetHoldStartedAt = now;
+      const stableNearTarget = now - this._targetHoldStartedAt >= TEMPO_TARGET_HOLD_SEC;
+      this._governedBps = stableNearTarget ? target : detected;
+      return this._governedBps;
+    }
+
+    this._targetHoldStartedAt = null;
+    this._governedBps = detected;
+    return this._governedBps;
+  }
+
   isFinished() { return this.position >= this.score.length; }
   progress()   { return this.position / this.score.length; }
 }
@@ -667,7 +731,14 @@ class Accompanist {
     this._raf      = null;
   }
 
-  start() {
+  start(startBeat = 0) {
+    const targetBeat = Math.max(0, Number(startBeat) || 0);
+    if (targetBeat > 0) {
+      this._running = true;
+      this.seek(targetBeat, this._bps);
+      this._tick();
+      return;
+    }
     const hasPrelude = this.events.some((event) => event[1] < this._nextSync - 0.01);
     if (hasPrelude) {
       this._syncBeat = 0;
@@ -714,6 +785,19 @@ class Accompanist {
     return this._syncBeat + (performance.now()/1000 - this._syncTime) * this._bps;
   }
 
+  currentBeat() {
+    return this._currentBeat();
+  }
+
+  seek(beat, bps = this._bps) {
+    const targetBeat = Math.max(0, Number(beat) || 0);
+    this._bps = Number.isFinite(bps) && bps > 0 ? bps : this._bps;
+    this._syncBeat = targetBeat;
+    this._syncTime = performance.now() / 1000 - _accompanimentLatencyCompSec;
+    this._nextSync = this.rhBeats.find((b) => b > targetBeat + 0.01) ?? Infinity;
+    this._lhIdx = eventIndexAtOrAfterBeat(this.events, targetBeat - 0.01);
+  }
+
   _tick() {
     if (!this._running) return;
 
@@ -731,6 +815,7 @@ class Accompanist {
             duration,
             pedaled: pedalRelease !== null,
             pedalHold: pedalRelease !== null ? Math.max(duration, (pedalRelease - beat) / Math.max(0.5, this._bps)) : null,
+            volume: state.playbackVolumes?.accompaniment ?? 1,
           });
           this._lhIdx++;
         }
@@ -761,8 +846,10 @@ let state = {
   paused:           false,
   pausedBeat:       0,
   pausedBps:        1,
+  practiceStartBeat: 0,
   finishedPlayback: false,
   guestMode:        false,
+  playbackVolumes:  { accompaniment: 0.5, solo: 2 },
   sheetView: { zoom: 1.0, rotation: 0 },
   sheetSource: null, // { name, variant, hasSheet, musicXml }
   sheetVariant: 'base',
@@ -777,6 +864,8 @@ let _finishPlaybackTimer = null;
 let _sheetMeasureEls = [];
 let _sheetHighlightRect = null;
 let _sheetHighlightIndex = -1;
+let _pendingSheetHighlightBeat = null;
+let _sheetRenderSeq = 0;
 let _fingeringJobPollTimer = null;
 const SCORE_LIBRARY_KEY = 'accompy_score_library_v1';
 const SCORE_LIBRARY_INIT_KEY = 'accompy_score_library_initialized_v1';
@@ -788,11 +877,11 @@ const GUEST_MODE_KEY = 'notepilot_guest_mode_v1';
 const GUEST_PROGRESS_KEY = 'notepilot_guest_progress_v1';
 const SCORE_RECENTS_KEY = 'notepilot_recent_scores_v1';
 const SCORE_PREFS_KEY = 'notepilot_score_preferences_v1';
+const PLAYBACK_VOLUME_KEY = 'notepilot_playback_volume_v3';
 const PRACTICE_SPLITTER_SIZE = 12;
 const LAYOUT_SPLITTER_SIZE = 12;
 let _appConfig = { supabase_enabled: false, auth_enabled: false };
 let _authUser = null;
-const OPENING_GUIDE_LEAD_BEATS = 0.75;
 
 const GUEST_DEMO_SCORES = [
   {
@@ -1861,6 +1950,62 @@ function initLatencyControls() {
   slider.dataset.bound = '1';
 }
 
+function normalizePlaybackVolume(value, fallback = 1) {
+  const numeric = Number.parseFloat(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(0, Math.min(3, numeric));
+}
+
+function readPlaybackVolumes() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PLAYBACK_VOLUME_KEY) || '{}');
+    return {
+      accompaniment: normalizePlaybackVolume(parsed.accompaniment, 0.5),
+      solo: normalizePlaybackVolume(parsed.solo, 2),
+    };
+  } catch {
+    return { accompaniment: 0.5, solo: 2 };
+  }
+}
+
+function writePlaybackVolumes() {
+  localStorage.setItem(PLAYBACK_VOLUME_KEY, JSON.stringify(state.playbackVolumes));
+}
+
+function updatePlaybackVolumeUI() {
+  ['accompaniment', 'solo'].forEach((channel) => {
+    const volume = normalizePlaybackVolume(state.playbackVolumes?.[channel], 1);
+    const percent = Math.round(volume * 100);
+    const slider = document.getElementById(`${channel}-volume-slider`);
+    const label = document.getElementById(`${channel}-volume-value`);
+    if (slider && slider.value !== String(percent)) slider.value = String(percent);
+    if (label) label.textContent = `${percent}%`;
+  });
+}
+
+function setPlaybackVolume(channel, value) {
+  if (!['accompaniment', 'solo'].includes(channel)) return;
+  const volume = normalizePlaybackVolume((Number.parseFloat(value) || 0) / 100, 1);
+  state.playbackVolumes = {
+    ...(state.playbackVolumes || {}),
+    [channel]: volume,
+  };
+  updatePlaybackVolumeUI();
+  writePlaybackVolumes();
+}
+
+function initPlaybackVolumeControls() {
+  state.playbackVolumes = readPlaybackVolumes();
+  updatePlaybackVolumeUI();
+  ['accompaniment', 'solo'].forEach((channel) => {
+    const slider = document.getElementById(`${channel}-volume-slider`);
+    if (!slider || slider.dataset.bound === '1') return;
+    slider.addEventListener('input', () => setPlaybackVolume(channel, slider.value));
+    slider.addEventListener('change', () => setPlaybackVolume(channel, slider.value));
+    slider.dataset.bound = '1';
+  });
+}
+
 function applyTheme(theme) {
   const normalized = theme === 'light' ? 'light' : 'dark';
   document.body.classList.toggle('light', normalized === 'light');
@@ -2028,22 +2173,15 @@ async function loadScoreList() {
     renderPlayPieceList();
     return;
   }
-  grid.innerHTML = scoreItems.map(({ name, has_sheet }) => `
+  grid.innerHTML = scoreItems.map(({ name }) => `
     <div class="score-card" id="card-${name}" onclick="openScore('${name}')">
       <div class="score-card-actions">
         <button class="rename-btn" onclick="renameScore(event, '${name}')" title="Rename piece">✎</button>
         <button class="delete-btn" onclick="deleteScore(event, '${name}')" title="Remove from my list">✕</button>
       </div>
-      <div class="score-preview${has_sheet ? '' : ' empty'}">
-        ${has_sheet
-          ? `<iframe
-              class="score-preview-frame"
-              src="/api/scores/${encodeURIComponent(name)}/sheet"
-              loading="lazy"
-              tabindex="-1"
-              aria-hidden="true"></iframe>`
-          : `<div class="score-preview-empty">No sheet preview</div>`
-        }
+      <div class="score-preview score-preview-lite" aria-hidden="true">
+        <div class="score-preview-lines"></div>
+        <span>${escapeHtml(displayNameForScore(name).slice(0, 1) || 'N')}</span>
       </div>
       <div class="score-card-meta">
         <h3>${escapeHtml(displayNameForScore(name))}</h3>
@@ -2051,10 +2189,6 @@ async function loadScoreList() {
       </div>
     </div>
   `).join('');
-  document.querySelectorAll('.score-preview-frame').forEach((frame) => {
-    frame.addEventListener('load', () => sanitizeSheetFrame(frame), { once: true });
-    sanitizeSheetFrame(frame);
-  });
   requestAnimationFrame(() => resizeScorePreviews());
   renderPlayPieceList();
 }
@@ -2211,44 +2345,6 @@ function triggerDownload(blob, filename) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-async function loadSheetIntoFrame(frame, url) {
-  const response = await fetch(url, { cache: 'no-store' });
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
-  const html = await response.text();
-  await new Promise((resolve, reject) => {
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeoutId);
-      resolve();
-    };
-    const fail = (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeoutId);
-      reject(error);
-    };
-    const onLoad = () => {
-      requestAnimationFrame(() => finish());
-    };
-    const timeoutId = setTimeout(() => {
-      const doc = frame.contentDocument;
-      if (doc?.documentElement?.innerHTML?.trim()) {
-        finish();
-        return;
-      }
-      fail(new Error('Sheet frame failed to load.'));
-    }, 1500);
-
-    frame.addEventListener('load', onLoad, { once: true });
-    frame.removeAttribute('src');
-    frame.srcdoc = html;
-  });
 }
 
 function clearFingeringJobPolling() {
@@ -2435,6 +2531,8 @@ async function pollFingeringJob(scoreName, jobId) {
 async function renderScoreSheet() {
   const data = state.current;
   if (!data) return;
+  const renderSeq = ++_sheetRenderSeq;
+  const scoreName = data.name;
 
   const frame = document.getElementById('sheet-frame');
   const placeholder = document.getElementById('sheet-placeholder');
@@ -2445,7 +2543,12 @@ async function renderScoreSheet() {
   musicXmlFallback.innerHTML = '';
   frame.style.display = 'none';
   frame.onload = null;
+  _sheetMeasureEls = [];
+  _sheetHighlightRect?.remove();
+  _sheetHighlightRect = null;
+  _sheetHighlightIndex = -1;
   placeholder.style.display = 'none';
+  placeholder.textContent = '';
   state.sheetSource = {
     name: data.name,
     variant: assets.variant,
@@ -2455,18 +2558,26 @@ async function renderScoreSheet() {
   updateSheetFingeringStatus();
   updateFingeringProgressUI();
 
+  const finalizeFrame = () => {
+    if (renderSeq !== _sheetRenderSeq || state.current?.name !== scoreName) return;
+    sanitizeSheetFrame(frame);
+    initializeSheetHighlighting();
+  };
+
   if (assets.hasSheet && !(data.guest && assets.musicXml)) {
+    const sheetUrl = `/api/scores/${encodeURIComponent(data.name)}/sheet?variant=${encodeURIComponent(assets.variant)}&v=${encodeURIComponent(renderSeq)}`;
     try {
-      await loadSheetIntoFrame(
-        frame,
-        `/api/scores/${encodeURIComponent(data.name)}/sheet?variant=${encodeURIComponent(assets.variant)}&v=${encodeURIComponent(Date.now())}`
-      );
-      sanitizeSheetFrame(frame);
-      initializeSheetHighlighting();
+      if (renderSeq !== _sheetRenderSeq || state.current?.name !== scoreName) return;
+      frame.addEventListener('load', finalizeFrame, { once: true });
+      frame.removeAttribute('srcdoc');
+      frame.src = sheetUrl;
       frame.style.display = 'block';
+      placeholder.style.display = 'none';
+      requestAnimationFrame(finalizeFrame);
       return;
     } catch (error) {
       console.warn(`Sheet render failed for ${data.name} (${assets.variant})`, error);
+      if (renderSeq !== _sheetRenderSeq || state.current?.name !== scoreName) return;
     }
   }
 
@@ -2474,8 +2585,9 @@ async function renderScoreSheet() {
   const renderedFallback = assets.musicXml
     ? await renderMusicXmlFallback(assets.musicXml)
     : false;
-  placeholder.style.display = renderedFallback ? 'none' : 'block';
-  placeholder.textContent = renderedFallback ? '' : 'Sheet preview unavailable for this score.';
+  if (renderSeq !== _sheetRenderSeq || state.current?.name !== scoreName) return;
+  placeholder.style.display = 'none';
+  placeholder.textContent = '';
   clearSheetHighlight();
 }
 
@@ -2670,6 +2782,7 @@ async function openScore(name, options = {}) {
     state.finishedPlayback = false;
     state.practiceRightHand = null;
     state.practiceLeftHand = null;
+    state.practiceStartBeat = 0;
     const parts = data.parts || [];
     setSelectedPartIndices(parts.length
       ? (previousParts || defaultSelectedPartsForScore(data, prefs))
@@ -2724,7 +2837,9 @@ async function openScore(name, options = {}) {
     updateNextKey(getRightHand(), 0);
     renderNoteHighway();
     syncExpectedMicNote();
-    preloadCurrentScoreInstruments();
+    setTimeout(() => {
+      if (state.current?.name === data.name) preloadCurrentScoreInstruments();
+    }, 500);
     renderPlayPieceList();
     if (updateUrl) updateScoreUrl(name);
     applyPracticeSplit(localStorage.getItem(PRACTICE_SPLIT_KEY));
@@ -2861,7 +2976,7 @@ function initializeSheetHighlighting() {
   const doc = frame?.contentDocument;
   if (!doc) return;
 
-  _sheetMeasureEls = [...doc.querySelectorAll('g.measure')];
+  _sheetMeasureEls = [...doc.querySelectorAll('g.measure, g[class~="measure"], g[class*=" measure "]')];
   _sheetHighlightRect = null;
   _sheetHighlightIndex = -1;
 
@@ -2882,11 +2997,39 @@ function initializeSheetHighlighting() {
         filter: drop-shadow(0 0 10px rgba(98, 255, 140, 0.65));
         pointer-events: none;
       }
+      .accompy-clickable-measure {
+        cursor: pointer;
+      }
+      .accompy-clickable-measure:hover {
+        filter: drop-shadow(0 0 7px rgba(37, 99, 255, 0.55));
+      }
     `;
     doc.head?.appendChild(style);
   }
 
-  updateSheetHighlight(0);
+  _sheetMeasureEls.forEach((measureEl, idx) => {
+    measureEl.classList.add('accompy-clickable-measure');
+    measureEl.setAttribute('role', 'button');
+    measureEl.setAttribute('tabindex', '0');
+    measureEl.setAttribute('aria-label', `Jump to measure ${idx + 1}`);
+    if (measureEl.dataset.notepilotJumpBound === '1') return;
+    const jump = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      jumpToSheetMeasure(idx);
+    };
+    measureEl.addEventListener('click', jump);
+    measureEl.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      jump(event);
+    });
+    measureEl.dataset.notepilotJumpBound = '1';
+  });
+
+  const rightHand = state.playing ? getRightHand() : [];
+  const beat = _pendingSheetHighlightBeat
+    ?? (rightHand.length ? currentGuideBeat(rightHand) : 0);
+  updateSheetHighlight(beat, { remember: false });
 }
 
 function clearSheetHighlight() {
@@ -2894,6 +3037,7 @@ function clearSheetHighlight() {
   _sheetHighlightRect?.remove();
   _sheetHighlightRect = null;
   _sheetHighlightIndex = -1;
+  _pendingSheetHighlightBeat = null;
 }
 
 function measureIndexForBeat(beat) {
@@ -2908,7 +3052,57 @@ function measureIndexForBeat(beat) {
   return Math.min(idx, _sheetMeasureEls.length - 1);
 }
 
-function updateSheetHighlight(beat) {
+function beatForMeasureIndex(measureIndex) {
+  const starts = state.current?.measure_beats || [];
+  if (!starts.length) return 0;
+  const idx = Math.max(0, Math.min(starts.length - 1, Number(measureIndex) || 0));
+  return Number(starts[idx]) || 0;
+}
+
+function jumpToSheetMeasure(measureIndex) {
+  const beat = beatForMeasureIndex(measureIndex);
+  seekPracticeToBeat(beat);
+}
+
+function seekPracticeToBeat(beat) {
+  const targetBeat = Math.max(0, Number(beat) || 0);
+  state.practiceStartBeat = targetBeat;
+  state.finishedPlayback = false;
+  clearFinishPlaybackTimer();
+
+  const rightHand = state.practiceRightHand || getRightHand();
+  const position = eventIndexAtOrAfterBeat(rightHand, targetBeat);
+  const bps = Math.max(0.35, state.pausedBps || _noteHighwayBps || state.tracker?.bps?.() || currentBps() || 1);
+
+  if (state.tracker) state.tracker.seekToBeat(targetBeat);
+  if (state.accompanist) {
+    state.accompanist.seek(targetBeat, bps);
+    if (state.paused) state.accompanist.pause();
+  }
+
+  state.pausedBeat = targetBeat;
+  state.pausedBps = bps;
+  _noteHighwayStartBeat = targetBeat;
+  _noteHighwayStartTime = state.playing && !state.paused ? performance.now() / 1000 : null;
+  _noteHighwayBps = bps;
+
+  updateNextKey(rightHand, state.tracker?.position ?? position);
+  updateSheetHighlight(targetBeat);
+  updatePracticePanelStatus();
+  const progress = rightHand.length ? Math.min(1, (state.tracker?.position ?? position) / rightHand.length) : 0;
+  const progressFill = document.getElementById('progress-fill');
+  if (progressFill) progressFill.style.width = `${(progress * 100).toFixed(1)}%`;
+  const beatVal = document.getElementById('beat-val');
+  if (beatVal) beatVal.textContent = targetBeat.toFixed(1);
+  const tempoVal = document.getElementById('tempo-val');
+  if (tempoVal && state.playing) tempoVal.textContent = `${Math.round(bps * 60)} BPM`;
+  renderNoteHighway();
+  syncExpectedMicNote();
+}
+
+function updateSheetHighlight(beat, options = {}) {
+  const remember = options.remember !== false;
+  if (remember && Number.isFinite(Number(beat))) _pendingSheetHighlightBeat = Number(beat);
   if (!_sheetMeasureEls.length) return;
   const idx = measureIndexForBeat(beat);
   if (idx < 0) return;
@@ -2916,12 +3110,16 @@ function updateSheetHighlight(beat) {
   const measureEl = _sheetMeasureEls[idx];
   if (!measureEl) return;
   const doc = measureEl.ownerDocument;
-  const overlayRoot = measureEl.closest('g.page-margin')
-    || measureEl.closest('svg.definition-scale')?.querySelector('g.page-margin')
-    || measureEl.parentNode;
+  const overlayRoot = measureEl.parentNode;
   if (!overlayRoot) return;
 
-  const bbox = measureEl.getBBox();
+  let bbox;
+  try {
+    bbox = measureEl.getBBox();
+  } catch {
+    return;
+  }
+  if (!bbox || bbox.width <= 0 || bbox.height <= 0) return;
   const starts = state.current?.measure_beats || [];
   const measureStart = starts[idx] ?? 0;
   const nextStart = starts[idx + 1];
@@ -2951,6 +3149,7 @@ function updateSheetHighlight(beat) {
   _sheetHighlightRect.setAttribute('y', String(y));
   _sheetHighlightRect.setAttribute('width', String(barWidth));
   _sheetHighlightRect.setAttribute('height', String(height));
+  _pendingSheetHighlightBeat = null;
 }
 
 // ── Keyboard visualiser ───────────────────────────────────────────────────────
@@ -2996,6 +3195,9 @@ function laneCodeForMidi(midi) {
 
 function currentGuideBeat(rightHand) {
   if (!rightHand.length) return 0;
+  if (!state.playing && Number.isFinite(Number(state.practiceStartBeat))) {
+    return Math.max(0, Number(state.practiceStartBeat) || 0);
+  }
   const trackerPos = state.tracker?.position ?? 0;
   const expectedBeat = rightHand[trackerPos]?.[1]
     ?? rightHand[rightHand.length - 1]?.[1]
@@ -3005,8 +3207,13 @@ function currentGuideBeat(rightHand) {
   const last = state.tracker?.timestamps?.[state.tracker.timestamps.length - 1];
   const anchorBeat = last?.beat ?? _noteHighwayStartBeat ?? 0;
   const anchorTime = last?.time ?? _noteHighwayStartTime;
-  const bps = state.tracker?.bps?.() ?? _noteHighwayBps ?? 1;
-  if (!last && trackerPos === 0) return Math.max(0, expectedBeat - OPENING_GUIDE_LEAD_BEATS);
+  const bps = _noteHighwayBps || state.tracker?.bps?.() || 1;
+  if (!last && trackerPos === 0) {
+    const accompanimentBeat = state.accompanist?.currentBeat?.();
+    return Number.isFinite(accompanimentBeat)
+      ? Math.max(0, Math.min(accompanimentBeat, expectedBeat))
+      : 0;
+  }
   if (!anchorTime) return Math.min(anchorBeat, expectedBeat);
 
   const estimated = anchorBeat + Math.max(0, performance.now() / 1000 - anchorTime) * bps;
@@ -3061,7 +3268,7 @@ function renderNoteHighway() {
   }
 
   const rightHand = getRightHand();
-  const trackerPos = state.tracker?.position ?? 0;
+  const trackerPos = state.tracker?.position ?? eventIndexAtOrAfterBeat(rightHand, state.practiceStartBeat ?? 0);
   const activeIndex = state.tracker?.isFinished?.()
     ? (state.tracker?._lastAdvancedPosition ?? trackerPos)
     : trackerPos;
@@ -3321,14 +3528,16 @@ async function startPlaying() {
 
   state.tracker     = new Tracker(right, initialBps);
   state.accompanist = new Accompanist(left, right, initialBps, leftInstruments);
-  state.accompanist.start();
+  const startBeat = Math.max(0, Number(state.practiceStartBeat) || 0);
+  state.tracker.seekToBeat(startBeat);
+  state.accompanist.start(startBeat);
   state.playing = true;
   state.paused = false;
-  state.pausedBeat = 0;
+  state.pausedBeat = startBeat;
   state.pausedBps = initialBps;
   state.finishedPlayback = false;
-  _noteHighwayStartTime = null;
-  _noteHighwayStartBeat = 0;
+  _noteHighwayStartTime = startBeat > 0 ? performance.now() / 1000 : null;
+  _noteHighwayStartBeat = startBeat;
   _noteHighwayBps = initialBps;
 
   startBtn.disabled = false;
@@ -3337,9 +3546,9 @@ async function startPlaying() {
   startBtn.classList.add('btn-primary');
   stopBtn.textContent = '■ End';
 
-  updateNextKey(right, 0);
+  updateNextKey(right, state.tracker.position);
   updatePracticePanelStatus();
-  updateSheetHighlight(0);
+  updateSheetHighlight(startBeat);
   startNoteHighwayLoop();
   enableMidi();
   if (_inputMode === 'mic') _startMic();
@@ -3354,7 +3563,7 @@ function togglePausePlaying() {
 
   if (!state.paused) {
     state.pausedBeat = currentGuideBeat(getRightHand());
-    state.pausedBps = state.tracker?.bps?.() ?? _noteHighwayBps ?? 1;
+    state.pausedBps = _noteHighwayBps || state.tracker?.accompanimentBps?.() || state.tracker?.bps?.() || 1;
     state.paused = true;
     state.accompanist?.pause();
     _stopMic();
@@ -3369,7 +3578,7 @@ function togglePausePlaying() {
   state.paused = false;
   _noteHighwayStartBeat = state.pausedBeat ?? 0;
   _noteHighwayStartTime = performance.now() / 1000;
-  _noteHighwayBps = state.pausedBps ?? (state.tracker?.bps?.() ?? 1);
+  _noteHighwayBps = state.pausedBps ?? (state.tracker?.accompanimentBps?.() ?? state.tracker?.bps?.() ?? 1);
   state.accompanist?.resume(_noteHighwayStartBeat, _noteHighwayBps);
   startBtn.textContent = '❚❚ Pause';
   updatePracticePanelStatus();
@@ -3386,7 +3595,7 @@ function clearFinishPlaybackTimer() {
 
 function scheduleFinishedPlayback() {
   if (_finishPlaybackTimer || !state.tracker?.isFinished?.()) return;
-  const bps = Math.max(0.35, state.tracker?.bps?.() ?? _noteHighwayBps ?? 1);
+  const bps = Math.max(0.35, _noteHighwayBps || state.tracker?.bps?.() || 1);
   const delayMs = Math.max(650, Math.min(2200, ((HIGHWAY_LOOK_BEHIND_BEATS + 0.18) / bps) * 1000));
   _finishPlaybackTimer = setTimeout(() => {
     _finishPlaybackTimer = null;
@@ -3436,20 +3645,26 @@ function stopPlaying(reason = 'stopped') {
 }
 
 // ── Note handler (called by keyboard and MIDI) ────────────────────────────────
+function advancePracticeClock(beat) {
+  const detectedBps = state.tracker.bps();
+  const accompanimentBps = state.tracker.accompanimentBps?.() ?? detectedBps;
+  _noteHighwayStartBeat = beat;
+  _noteHighwayStartTime = performance.now() / 1000;
+  _noteHighwayBps = accompanimentBps;
+  state.pausedBps = accompanimentBps;
+  state.accompanist.onRhNote(beat, accompanimentBps);
+  updateSheetHighlight(beat);
+  document.getElementById('beat-val').textContent  = beat.toFixed(1);
+  document.getElementById('tempo-val').textContent = Math.round(detectedBps * 60) + ' BPM';
+  document.getElementById('progress-fill').style.width =
+    (state.tracker.progress() * 100).toFixed(1) + '%';
+}
+
 function handleNoteMic(midi) {
   if (!state.playing || state.paused || !state.tracker) return;
   const beat = state.tracker.onNoteFuzzy(midi);
   if (beat !== null) {
-    const bps = state.tracker.bps();
-    _noteHighwayStartBeat = beat;
-    _noteHighwayStartTime = performance.now() / 1000;
-    _noteHighwayBps = bps;
-    state.accompanist.onRhNote(beat, bps);
-    updateSheetHighlight(beat);
-    document.getElementById('beat-val').textContent  = beat.toFixed(1);
-    document.getElementById('tempo-val').textContent = Math.round(bps * 60) + ' BPM';
-    document.getElementById('progress-fill').style.width =
-      (state.tracker.progress() * 100).toFixed(1) + '%';
+    advancePracticeClock(beat);
     updateNextKey(getRightHand(), state.tracker.position);
     syncExpectedMicNote();
   }
@@ -3463,6 +3678,7 @@ function handleNote(midi) {
     duration: expectedEvent ? eventDurationSeconds(expectedEvent, getInstrumentForPart(state.selectedPart ?? 0)) : undefined,
     pedaled: expectedEvent ? isPedaledEvent(expectedEvent) : false,
     pedalHold: expectedEvent ? eventPedalHoldSeconds(expectedEvent) : null,
+    volume: state.playbackVolumes?.solo ?? 1,
   });
   const keyId = cueKeyIdForMidi(midi);
   highlightKey(keyId, true);
@@ -3472,16 +3688,7 @@ function handleNote(midi) {
 
   const beat = state.tracker.onNote(midi);
   if (beat !== null) {
-    const bps = state.tracker.bps();
-    _noteHighwayStartBeat = beat;
-    _noteHighwayStartTime = performance.now() / 1000;
-    _noteHighwayBps = bps;
-    state.accompanist.onRhNote(beat, bps);
-    updateSheetHighlight(beat);
-    document.getElementById('beat-val').textContent  = beat.toFixed(1);
-    document.getElementById('tempo-val').textContent = Math.round(bps * 60) + ' BPM';
-    document.getElementById('progress-fill').style.width =
-      (state.tracker.progress() * 100).toFixed(1) + '%';
+    advancePracticeClock(beat);
     updateNextKey(getRightHand(), state.tracker.position);
   }
 
@@ -3507,16 +3714,7 @@ function handleMidiNote(midi) {
 
   const beat = state.tracker.onNote(midi);
   if (beat !== null) {
-    const bps = state.tracker.bps();
-    _noteHighwayStartBeat = beat;
-    _noteHighwayStartTime = performance.now() / 1000;
-    _noteHighwayBps = bps;
-    state.accompanist.onRhNote(beat, bps);
-    updateSheetHighlight(beat);
-    document.getElementById('beat-val').textContent  = beat.toFixed(1);
-    document.getElementById('tempo-val').textContent = Math.round(bps * 60) + ' BPM';
-    document.getElementById('progress-fill').style.width =
-      (state.tracker.progress() * 100).toFixed(1) + '%';
+    advancePracticeClock(beat);
     updateNextKey(getRightHand(), state.tracker.position);
   }
 
@@ -4205,6 +4403,7 @@ function initImportControls() {
 }
 
 window.importScoreFiles = importScoreFiles;
+window.setPlaybackVolume = setPlaybackVolume;
 
 function initTempoControls() {
   const input = document.getElementById('bpm-input');
@@ -4223,6 +4422,7 @@ function initTempoControls() {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 initLatencyControls();
+initPlaybackVolumeControls();
 initImportControls();
 initTempoControls();
 initKeyboardLayoutToggle();

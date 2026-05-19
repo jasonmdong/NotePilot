@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from src.fingering import normalize_fingering_state
 
 
-def _score_row_to_payload(row: dict) -> dict:
+def _score_row_to_payload(row: dict, *, include_sheet_assets: bool = True) -> dict:
     score_data = row.get("score_data") or {}
     parts = score_data.get("parts") or []
     musicxml_source = score_data.get("musicxml_source") or ""
@@ -46,9 +46,9 @@ def _score_row_to_payload(row: dict) -> dict:
         "measure_beats": row.get("measure_beats") or [],
         "right_hand": right_hand,
         "left_hand": left_hand,
-        "sheet_html": sheet_html if has_sheet else "",
-        "musicxml_source": musicxml_source,
-        "fingered_musicxml_source": fingered_musicxml_source,
+        "sheet_html": sheet_html if include_sheet_assets and has_sheet else "",
+        "musicxml_source": musicxml_source if include_sheet_assets else "",
+        "fingered_musicxml_source": fingered_musicxml_source if include_sheet_assets else "",
         "fingering": fingering,
     }
 
@@ -88,7 +88,7 @@ class SupabaseScoreStore:
             "GET",
             "scores",
             params={
-                "select": "slug,title,sheet_html,score_data,created_at",
+                "select": "slug,title,created_at",
                 "user_id": f"eq.{user_id}",
                 "order": "created_at.desc",
             },
@@ -101,7 +101,7 @@ class SupabaseScoreStore:
                     "name": row["slug"],
                     "title": row.get("title") or row["slug"],
                     "created_at": row.get("created_at"),
-                    "has_sheet": "<svg" in (row.get("sheet_html") or "") or bool((row.get("score_data") or {}).get("musicxml_source")),
+                    "has_sheet": True,
                 }
                 for row in rows if row.get("slug")
             ],
@@ -122,21 +122,32 @@ class SupabaseScoreStore:
             raise HTTPException(status_code=404, detail=f"Score '{name}' not found")
         return rows[0]
 
-    def load_score(self, user_id: str, name: str):
-        return _score_row_to_payload(self.load_score_row(user_id, name))
+    def load_score(self, user_id: str, name: str, *, include_sheet_assets: bool = True):
+        return _score_row_to_payload(
+            self.load_score_row(user_id, name),
+            include_sheet_assets=include_sheet_assets,
+        )
 
     def save_score(self, user_id: str, payload: dict):
         existing = self._request(
             "GET",
             "scores",
             params={
-                "select": "id,score_data",
+                "select": "id,score_data,measure_beats,sheet_html",
                 "user_id": f"eq.{user_id}",
                 "slug": f"eq.{payload['name']}",
                 "limit": "1",
             },
         ) or []
         existing_score_data = (existing[0].get("score_data") or {}) if existing else {}
+        existing_measure_beats = existing[0].get("measure_beats") if existing else []
+        existing_sheet_html = existing[0].get("sheet_html") if existing else ""
+
+        def payload_or_existing(key: str, default=""):
+            if key in payload:
+                return payload[key] if payload[key] is not None else default
+            return existing_score_data.get(key) or default
+
         row = {
             "user_id": user_id,
             "slug": payload["name"],
@@ -144,13 +155,13 @@ class SupabaseScoreStore:
             "source_type": payload.get("source_type") or "converted",
             "score_data": {
                 "parts": payload["parts"],
-                "musicxml_source": payload.get("musicxml_source") or "",
-                "fingered_musicxml_source": payload["fingered_musicxml_source"] if "fingered_musicxml_source" in payload else (existing_score_data.get("fingered_musicxml_source") or ""),
-                "fingered_sheet_html": payload["fingered_sheet_html"] if "fingered_sheet_html" in payload else (existing_score_data.get("fingered_sheet_html") or ""),
+                "musicxml_source": payload_or_existing("musicxml_source"),
+                "fingered_musicxml_source": payload_or_existing("fingered_musicxml_source"),
+                "fingered_sheet_html": payload_or_existing("fingered_sheet_html"),
                 "fingering": payload["fingering"] if "fingering" in payload else (existing_score_data.get("fingering") or {}),
             },
-            "measure_beats": payload.get("measure_beats") or [],
-            "sheet_html": payload.get("sheet_html") or "",
+            "measure_beats": payload["measure_beats"] if "measure_beats" in payload else (existing_measure_beats or []),
+            "sheet_html": payload["sheet_html"] if "sheet_html" in payload else (existing_sheet_html or ""),
         }
         if existing:
             result = self._request(
@@ -182,6 +193,18 @@ class SupabaseScoreStore:
                 "user_id": f"eq.{user_id}",
                 "slug": f"eq.{name}",
             },
+            headers={"Prefer": "return=minimal"},
+        )
+
+    def update_score_sheet_html(self, user_id: str, name: str, sheet_html: str):
+        self._request(
+            "PATCH",
+            "scores",
+            params={
+                "user_id": f"eq.{user_id}",
+                "slug": f"eq.{name}",
+            },
+            json_body={"sheet_html": sheet_html or ""},
             headers={"Prefer": "return=minimal"},
         )
 

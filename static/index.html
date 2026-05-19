@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>NotePilot</title>
-  <link rel="stylesheet" href="/style.css?v=20260518-parts-text">
+  <link rel="stylesheet" href="/style.css?v=20260519-sheet-measure-jump">
 </head>
 <body>
 
@@ -345,6 +345,35 @@
                oninput="setLatencyCompensation(this.value)">
         <span id="latency-value">0 ms</span>
       </div>
+      <div class="mixer-controls" aria-label="Playback volume">
+        <div class="mixer-header">
+          <span>Volume</span>
+        </div>
+        <label class="mixer-row" for="accompaniment-volume-slider">
+          <span>Accompaniment</span>
+          <input
+            id="accompaniment-volume-slider"
+            type="range"
+            min="0"
+            max="150"
+            step="5"
+            value="50"
+            oninput="setPlaybackVolume('accompaniment', this.value)">
+          <strong id="accompaniment-volume-value">50%</strong>
+        </label>
+        <label class="mixer-row" for="solo-volume-slider">
+          <span>Solo</span>
+          <input
+            id="solo-volume-slider"
+            type="range"
+            min="0"
+            max="300"
+            step="5"
+            value="200"
+            oninput="setPlaybackVolume('solo', this.value)">
+          <strong id="solo-volume-value">200%</strong>
+        </label>
+      </div>
       <div id="part-picker" class="part-picker" style="display:none">
         <h5>Your part(s)</h5>
         <div id="part-buttons" class="part-buttons"></div>
@@ -458,6 +487,6 @@
 <script src="https://unpkg.com/tone@15.1.22/build/Tone.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.9.2/build/opensheetmusicdisplay.min.js"></script>
 <script src="/pitch.js"></script>
-<script src="/app.js?v=20260518-parts-text"></script>
+<script src="/app.js?v=20260519-sheet-measure-jump"></script>
 </body>
 </html>

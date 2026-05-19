@@ -759,6 +759,39 @@ body.auth-mode .score-grid {
   align-items: center;
   justify-content: center;
 }
+.score-preview-lite {
+  display: grid;
+  place-items: center;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--panel-alt) 92%, white 8%), var(--panel)),
+    var(--panel-alt);
+}
+.score-preview-lines {
+  position: absolute;
+  inset: 20% 10%;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent 13px,
+    color-mix(in srgb, var(--muted-2) 34%, transparent) 14px,
+    transparent 15px,
+    transparent 28px
+  );
+  opacity: .55;
+}
+.score-preview-lite span {
+  position: relative;
+  width: 3.5rem;
+  height: 3.5rem;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--border));
+  color: var(--accent);
+  font-weight: 800;
+  font-size: 1.35rem;
+}
 .score-preview-empty {
   color: var(--muted-2);
   font-size: .85rem;
@@ -2462,6 +2495,46 @@ body.practice-resizing {
   align-items: center;
   gap: .5rem;
   margin: 0 0 .85rem;
+}
+
+.mixer-controls {
+  display: grid;
+  gap: .5rem;
+  margin: 0 0 .9rem;
+  padding: .7rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
+}
+
+.mixer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: .78rem;
+  font-weight: 800;
+}
+
+.mixer-row {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr) 42px;
+  align-items: center;
+  gap: .55rem;
+  margin: 0;
+  color: var(--muted);
+  font-size: .78rem;
+}
+
+.mixer-row input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.mixer-row strong {
+  color: var(--text);
+  font-size: .76rem;
+  text-align: right;
 }
 
 .setup-card .part-picker,

@@ -932,7 +932,7 @@ def list_scores(request: Request):
 @app.get("/api/scores/{name}")
 def get_score(name: str, request: Request):
     user_id = require_supabase_user_id(request, "score loading")
-    return ensure_fingering_state(_score_store.load_score(user_id, name))
+    return ensure_fingering_state(_score_store.load_score(user_id, name, include_sheet_assets=False))
 
 
 class InstrumentUpdate(BaseModel):
@@ -1017,6 +1017,11 @@ def get_sheet(name: str, request: Request, variant: str = "base"):
                 title,
                 score.get("musicxml_source") or "",
             )
+            if html and "<svg" in html:
+                try:
+                    _score_store.update_score_sheet_html(user_id, name, html)
+                except Exception as exc:
+                    print(f"Could not cache rendered sheet HTML for {name}: {exc}")
     if not html or "<svg" not in html:
         raise HTTPException(status_code=404, detail="No sheet music for this score")
     html = re.sub(r"\s*<h1>.*?</h1>\s*", "\n", html, count=1, flags=re.IGNORECASE | re.DOTALL)
