@@ -282,7 +282,175 @@ def _xml_local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1] if "}" in tag else tag
 
 
-def filter_musicxml_parts(xml_text: str, part_indices: list[int] | None) -> str:
+def _musicxml_child(parent, local_name: str):
+    return next((child for child in list(parent) if _xml_local_name(child.tag) == local_name), None)
+
+
+def _musicxml_child_text(parent, local_name: str) -> str | None:
+    child = _musicxml_child(parent, local_name)
+    return child.text.strip() if child is not None and child.text else None
+
+
+def _set_musicxml_child_text(parent, local_name: str, value: str):
+    child = _musicxml_child(parent, local_name)
+    if child is not None:
+        child.text = value
+
+
+def _source_part_selections(
+    part_indices: list[int] | None,
+    score_parts_meta: list[dict] | None,
+    score_part_ids: list[str],
+    staff_slots: list[tuple[str, int]],
+) -> dict[str, set[int] | None]:
+    if not part_indices:
+        return {}
+
+    selections: dict[str, set[int] | None] = {}
+    if score_parts_meta:
+        has_source_metadata = any(
+            (part or {}).get("source_part_id") or (part or {}).get("source_staff")
+            for part in score_parts_meta
+        )
+        if not has_source_metadata and len(staff_slots) >= len(score_parts_meta) > 1:
+            for idx in part_indices:
+                if 0 <= idx < len(staff_slots):
+                    part_id, staff_num = staff_slots[idx]
+                    selections.setdefault(part_id, set()).add(staff_num)
+            if selections:
+                return selections
+
+        if not has_source_metadata and len(score_part_ids) == 1 and len(score_parts_meta) > 1:
+            selections[score_part_ids[0]] = {idx + 1 for idx in part_indices if 0 <= idx < len(score_parts_meta)}
+            return selections
+
+        for idx in part_indices:
+            if idx < 0 or idx >= len(score_parts_meta):
+                continue
+            meta = score_parts_meta[idx] or {}
+            part_id = str(meta.get("source_part_id") or "").strip()
+            if not part_id and idx < len(score_part_ids):
+                part_id = score_part_ids[idx]
+            if not part_id:
+                continue
+            staff = meta.get("source_staff")
+            try:
+                staff_num = int(staff) if staff is not None else None
+            except (TypeError, ValueError):
+                staff_num = None
+            if staff_num:
+                current = selections.setdefault(part_id, set())
+                if current is not None:
+                    current.add(staff_num)
+            else:
+                selections[part_id] = None
+
+    if selections:
+        return selections
+
+    if len(score_part_ids) == 1 and score_parts_meta and len(score_parts_meta) > 1:
+        selections[score_part_ids[0]] = {idx + 1 for idx in part_indices if 0 <= idx < len(score_parts_meta)}
+        return selections
+
+    for idx in part_indices:
+        if 0 <= idx < len(score_part_ids):
+            selections[score_part_ids[idx]] = None
+    return selections
+
+
+def _musicxml_part_staff_counts(root, score_part_ids: list[str]) -> dict[str, int]:
+    counts = {part_id: 1 for part_id in score_part_ids if part_id}
+    for part_el in [child for child in list(root) if _xml_local_name(child.tag) == "part"]:
+        part_id = part_el.attrib.get("id")
+        if not part_id:
+            continue
+        max_staves = 1
+        for attributes in part_el.iter():
+            if _xml_local_name(attributes.tag) != "attributes":
+                continue
+            staves_text = _musicxml_child_text(attributes, "staves")
+            if staves_text:
+                try:
+                    max_staves = max(max_staves, int(staves_text))
+                except ValueError:
+                    pass
+        counts[part_id] = max_staves
+    return counts
+
+
+def _musicxml_staff_slots(staff_counts: dict[str, int], score_part_ids: list[str]) -> list[tuple[str, int]]:
+    slots: list[tuple[str, int]] = []
+    for part_id in score_part_ids:
+        if not part_id:
+            continue
+        staves = max(1, int(staff_counts.get(part_id) or 1))
+        for staff_num in range(1, staves + 1):
+            slots.append((part_id, staff_num))
+    return slots
+
+
+def _selected_staff_set_for_part(
+    part_id: str,
+    selected_staves: set[int] | None,
+    total_staves: int,
+) -> set[int] | None:
+    if selected_staves is None:
+        return None
+    valid = {staff for staff in selected_staves if staff >= 1}
+    if not valid or total_staves <= 1 or len(valid) >= total_staves:
+        return None
+    return valid
+
+
+def _filter_part_to_staves(part_el, selected_staves: set[int]):
+    for measure in [child for child in list(part_el) if _xml_local_name(child.tag) == "measure"]:
+        for child in list(measure):
+            local_name = _xml_local_name(child.tag)
+            if local_name == "note":
+                staff_text = _musicxml_child_text(child, "staff")
+                if staff_text:
+                    try:
+                        staff_num = int(staff_text)
+                    except ValueError:
+                        staff_num = None
+                    if staff_num is not None and staff_num not in selected_staves:
+                        measure.remove(child)
+                        continue
+                    _set_musicxml_child_text(child, "staff", "1")
+            elif local_name == "direction":
+                staff_text = _musicxml_child_text(child, "staff")
+                if staff_text:
+                    try:
+                        staff_num = int(staff_text)
+                    except ValueError:
+                        staff_num = None
+                    if staff_num is not None and staff_num not in selected_staves:
+                        measure.remove(child)
+                        continue
+                    _set_musicxml_child_text(child, "staff", "1")
+            elif local_name == "attributes":
+                _set_musicxml_child_text(child, "staves", "1")
+                for attr_child in list(child):
+                    attr_local = _xml_local_name(attr_child.tag)
+                    if attr_local not in {"clef", "staff-details", "transpose"}:
+                        continue
+                    number = attr_child.attrib.get("number")
+                    if number:
+                        try:
+                            staff_num = int(number)
+                        except ValueError:
+                            staff_num = None
+                        if staff_num is not None and staff_num not in selected_staves:
+                            child.remove(attr_child)
+                            continue
+                    attr_child.attrib["number"] = "1"
+
+
+def filter_musicxml_parts(
+    xml_text: str,
+    part_indices: list[int] | None,
+    score_parts_meta: list[dict] | None = None,
+) -> str:
     if not part_indices:
         return xml_text
     try:
@@ -295,14 +463,15 @@ def filter_musicxml_parts(xml_text: str, part_indices: list[int] | None) -> str:
         return ""
 
     score_parts = [child for child in list(part_list) if _xml_local_name(child.tag) == "score-part"]
-    selected_ids = {
-        score_parts[idx].attrib.get("id")
-        for idx in part_indices
-        if 0 <= idx < len(score_parts) and score_parts[idx].attrib.get("id")
-    }
+    score_part_ids = [part.attrib.get("id", "") for part in score_parts]
+    staff_counts = _musicxml_part_staff_counts(root, score_part_ids)
+    staff_slots = _musicxml_staff_slots(staff_counts, score_part_ids)
+    selections = _source_part_selections(part_indices, score_parts_meta, score_part_ids, staff_slots)
+    selected_ids = {part_id for part_id in selections if part_id}
     if not selected_ids:
         return ""
-    if len(selected_ids) == len(score_parts):
+    has_staff_filter = any(staves is not None for staves in selections.values())
+    if len(selected_ids) == len(score_parts) and not has_staff_filter:
         return xml_text
 
     for child in list(part_list):
@@ -313,8 +482,17 @@ def filter_musicxml_parts(xml_text: str, part_indices: list[int] | None) -> str:
             part_list.remove(child)
 
     for child in list(root):
-        if _xml_local_name(child.tag) == "part" and child.attrib.get("id") not in selected_ids:
+        if _xml_local_name(child.tag) != "part":
+            continue
+        part_id = child.attrib.get("id")
+        if part_id not in selected_ids:
             root.remove(child)
+            continue
+        staves = selections.get(part_id)
+        staves_count = staff_counts.get(part_id or "", 1)
+        selected_staves = _selected_staff_set_for_part(part_id or "", staves, staves_count)
+        if selected_staves:
+            _filter_part_to_staves(child, selected_staves)
 
     return ET.tostring(root, encoding="unicode")
 
@@ -1198,11 +1376,12 @@ def get_sheet(name: str, request: Request, variant: str = "base", parts: str | N
     title = score.get("title") or score.get("name") or name
     score_data = row.get("score_data") or {}
     part_indices = parse_sheet_part_indices(parts)
+    score_parts_meta = score.get("parts") or []
     cached_base_html = (row.get("sheet_html") or score.get("sheet_html") or "").strip()
     cached_fingered_html = (score_data.get("fingered_sheet_html") or "").strip()
 
     def render_filtered_source(xml_source: str, *, stack_fingering_chords: bool = False) -> str:
-        filtered_source = filter_musicxml_parts(xml_source, part_indices)
+        filtered_source = filter_musicxml_parts(xml_source, part_indices, score_parts_meta)
         if not filtered_source:
             return ""
         return render_sheet_html_from_musicxml_text(

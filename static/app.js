@@ -2872,12 +2872,6 @@ async function renderScoreSheet() {
     } catch (error) {
       console.warn(`Sheet render failed for ${data.name} (${assets.variant}, parts=${sheetPartsParam || 'full'})`, error);
       if (renderSeq !== _sheetRenderSeq || state.current?.name !== scoreName) return;
-
-      if (sheetPartsParam) {
-        const fullKey = sheetHtmlCacheKey(data.name, assets.variant, '');
-        const fullEntry = _sheetHtmlCache.get(fullKey);
-        if (fullEntry && showSheetHtmlEntry(fullEntry)) return;
-      }
     }
   }
 

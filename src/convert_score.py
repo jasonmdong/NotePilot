@@ -519,13 +519,23 @@ def build_parts_data(score) -> list:
     for p in score_parts:
         part_name = p.partName or f"Part {len(parts_data) + 1}"
         instrument = _detect_instrument(p)
+        source_part_id, source_staff = _source_part_staff(p)
         local_pedals = _pedal_spans(p, anchor=score)
         if shared_pedal_score:
             pedal_spans = sorted(set(local_pedals + global_pedals))
         else:
             pedal_spans = local_pedals
         notes = extract_events(p, pedal_spans=pedal_spans)
-        parts_data.append({"name": part_name, "instrument": instrument, "notes": notes})
+        part_data = {
+            "name": part_name,
+            "instrument": instrument,
+            "notes": notes,
+        }
+        if source_part_id:
+            part_data["source_part_id"] = source_part_id
+        if source_staff:
+            part_data["source_staff"] = source_staff
+        parts_data.append(part_data)
     return parts_data
 
 
@@ -541,6 +551,15 @@ def score_for_playback(score):
         return score.toSoundingPitch(inPlace=False)
     except Exception:
         return score
+
+
+def _source_part_staff(part) -> tuple[str | None, int | None]:
+    """Return MusicXML source part/staff metadata for music21 PartStaff streams."""
+    part_id = str(getattr(part, "id", "") or "")
+    match = re.fullmatch(r"(.+)-Staff(\d+)", part_id)
+    if match:
+        return match.group(1), int(match.group(2))
+    return part_id or None, None
 
 
 def extract_measure_beats(score) -> list[float]:
