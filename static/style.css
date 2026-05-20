@@ -737,17 +737,26 @@ body.auth-mode .score-grid {
   display: flex;
   align-items: center;
   gap: .75rem;
+  min-width: 0;
 }
 
 .import-status {
+  display: block;
+  margin-top: .55rem;
   font-size: .8rem;
   color: var(--muted);
 }
 
+.import-status[hidden] {
+  display: none;
+}
+
 .import-progress {
+  flex: 1;
+  min-width: 12rem;
   display: grid;
   gap: .35rem;
-  padding: .7rem .75rem;
+  padding: .45rem .55rem;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: color-mix(in srgb, var(--surface) 90%, var(--accent) 10%);
@@ -794,6 +803,17 @@ body.auth-mode .score-grid {
 @keyframes import-progress-sheen {
   from { transform: translateX(-100%); }
   to { transform: translateX(100%); }
+}
+
+@media (max-width: 620px) {
+  .upload-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .import-progress {
+    min-width: 0;
+  }
 }
 
 /* ── Screens ── */

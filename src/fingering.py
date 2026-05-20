@@ -25,8 +25,38 @@ def engine_available() -> bool:
     return importlib.util.find_spec("pianoplayer") is not None
 
 
+PIANO_PART_KEYWORDS = (
+    "piano",
+    "pianoforte",
+    "pno",
+    "keyboard",
+    "klavier",
+    "clavier",
+)
+
+
+def _part_text(part: dict) -> str:
+    values = [
+        part.get("name"),
+        part.get("instrument"),
+        part.get("instrument_name"),
+        part.get("part_name"),
+        part.get("midi_instrument"),
+    ]
+    return " ".join(str(value or "") for value in values).lower()
+
+
+def is_piano_part(part: dict) -> bool:
+    text = _part_text(part or {})
+    return any(keyword in text for keyword in PIANO_PART_KEYWORDS)
+
+
+def piano_part_indices(parts_data: list[dict]) -> list[int]:
+    return [idx for idx, part in enumerate(parts_data or []) if is_piano_part(part or {})]
+
+
 def score_is_eligible(parts_data: list[dict]) -> bool:
-    return 0 < len(parts_data) <= 2
+    return bool(piano_part_indices(parts_data))
 
 
 def build_fingering_state(parts_data: list[dict]) -> dict:
@@ -34,6 +64,7 @@ def build_fingering_state(parts_data: list[dict]) -> dict:
         "engine": ENGINE_NAME,
         "available": engine_available(),
         "eligible": score_is_eligible(parts_data),
+        "piano_part_indices": piano_part_indices(parts_data),
         "applied": False,
         "hand_size": None,
         "annotations": 0,

@@ -47,6 +47,9 @@ const INSTRUMENTS = [
   'bassoon',
   'horn',
   'trumpet',
+  'trombone',
+  'tuba',
+  'timpani',
   'voice',
 ];
 const TEMPO_PAUSE_IGNORE_SEC = 3;
@@ -111,12 +114,64 @@ const SAMPLE_LIBRARY = {
   bassoon: soundfontPreset('bassoon', 1, 4, { release: 0.3, noteDuration: 0.5, gainDb: -3 }),
   horn: soundfontPreset('french_horn', 2, 5, { release: 0.36, noteDuration: 0.58, gainDb: -5 }),
   trumpet: soundfontPreset('trumpet', 3, 6, { release: 0.24, noteDuration: 0.42, gainDb: -5 }),
+  trombone: soundfontPreset('trombone', 2, 5, { release: 0.34, noteDuration: 0.54, gainDb: -5 }),
+  tuba: soundfontPreset('tuba', 1, 4, { release: 0.38, noteDuration: 0.62, gainDb: -5 }),
+  timpani: soundfontPreset('timpani', 1, 4, { release: 0.5, noteDuration: 0.7, gainDb: -3 }),
   voice: soundfontPreset('choir_aahs', 3, 6, { release: 0.55, noteDuration: 0.72, gainDb: -5 }),
 };
 
 let _toneReady = false;
 const _sampleSamplers = {};
 const _sampleSamplerReady = {};
+
+const PART_NAME_INSTRUMENT_HINTS = [
+  ['piano', 'piano'],
+  ['contrabass', 'contrabass'],
+  ['contrabasses', 'contrabass'],
+  ['contrabassi', 'contrabass'],
+  ['double bass', 'contrabass'],
+  ['bassi', 'contrabass'],
+  ['basso', 'contrabass'],
+  ['violin', 'violin'],
+  ['violino', 'violin'],
+  ['viola', 'viola'],
+  ['cello', 'cello'],
+  ['violoncello', 'cello'],
+  ['bassoon', 'bassoon'],
+  ['fagotti', 'bassoon'],
+  ['fagotto', 'bassoon'],
+  ['trumpet', 'trumpet'],
+  ['trombe', 'trumpet'],
+  ['tromba', 'trumpet'],
+  ['trombone', 'trombone'],
+  ['tromboni', 'trombone'],
+  ['trombono', 'trombone'],
+  ['tuba', 'tuba'],
+  ['timpani', 'timpani'],
+  ['timpano', 'timpani'],
+  ['horn', 'horn'],
+  ['corni', 'horn'],
+  ['corno', 'horn'],
+  ['clarinet', 'clarinet'],
+  ['clarinetti', 'clarinet'],
+  ['clarinetto', 'clarinet'],
+  ['flute', 'flute'],
+  ['flauti', 'flute'],
+  ['flauto', 'flute'],
+  ['oboe', 'oboe'],
+  ['oboi', 'oboe'],
+  ['soprano', 'flute'],
+  ['alto', 'clarinet'],
+  ['tenor', 'violin'],
+  ['bass', 'contrabass'],
+];
+
+function inferInstrumentFromPartName(partName = '') {
+  const normalized = String(partName || '').trim().toLowerCase();
+  if (!normalized) return null;
+  const match = PART_NAME_INSTRUMENT_HINTS.find(([keyword]) => normalized.includes(keyword));
+  return match?.[1] || null;
+}
 
 // instrument presets: { harmonics: [[mult, amp]], attack, decay, sustain, release, type }
 const INSTRUMENT_PRESETS = {
@@ -132,6 +187,9 @@ const INSTRUMENT_PRESETS = {
   bassoon:  { harmonics:[[1,.68],[2,.17],[3,.12],[4,.05]], attack:.035, decay:.48, type:'triangle' },
   horn:     { harmonics:[[1,.55],[2,.28],[3,.12],[4,.05]], attack:.045, decay:.5, type:'triangle' },
   trumpet:  { harmonics:[[1,.52],[2,.32],[3,.18],[4,.08]], attack:.018, decay:.36, type:'sawtooth' },
+  trombone: { harmonics:[[1,.58],[2,.26],[3,.12],[4,.04]], attack:.035, decay:.44, type:'sawtooth' },
+  tuba:     { harmonics:[[1,.72],[2,.2],[3,.07],[4,.03]], attack:.045, decay:.52, type:'triangle' },
+  timpani:  { harmonics:[[1,.78],[1.5,.18],[2,.08],[2.7,.04]], attack:.012, decay:1.1, type:'sine' },
   voice:    { harmonics:[[1,.62],[2,.2],[3,.1],[4,.05],[5,.03]], attack:.05, decay:.55, type:'triangle', vibrato:true },
 };
 
@@ -185,6 +243,10 @@ function eventDynamic(event) {
   return eventMetadata(event, 'dynamic');
 }
 
+function eventArticulation(event) {
+  return eventMetadata(event, 'articulation');
+}
+
 function eventSourceInstrument(event) {
   const source = eventMetadata(event, 'instrument');
   return typeof source?.instrument === 'string' ? source.instrument : null;
@@ -199,9 +261,11 @@ function appendEventMetadata(event, metadata) {
 
 function eventVelocity(event, fallback = 0.5) {
   const velocity = Number(eventDynamic(event)?.velocity);
-  return Number.isFinite(velocity)
+  const baseVelocity = Number.isFinite(velocity)
     ? Math.max(0.08, Math.min(1, velocity))
     : fallback;
+  const articulationScale = Number(eventArticulation(event)?.velocityScale);
+  return Math.max(0.04, Math.min(1.15, baseVelocity * (Number.isFinite(articulationScale) ? articulationScale : 1)));
 }
 
 function isPedaledEvent(event) {
@@ -219,7 +283,8 @@ function eventDurationSeconds(event, instrument = 'piano', fallbackBeats = 0.75)
   const beats = eventDuration(event, fallbackBeats);
   const seconds = beats / Math.max(0.5, currentBps());
   const pianoBoost = instrument === 'piano' ? 1.22 : 1.0;
-  return Math.max(0.14, seconds * pianoBoost);
+  const articulationScale = Number(eventArticulation(event)?.durationScale);
+  return Math.max(0.08, seconds * pianoBoost * (Number.isFinite(articulationScale) ? articulationScale : 1));
 }
 
 function isSustainedStringInstrument(instrument) {
@@ -546,6 +611,7 @@ function expandedTremoloEvents(event, bps = currentBps()) {
   const intervalBeats = durationBeats / attackCount;
   const pedalRelease = eventPedalRelease(event);
   const dynamic = eventDynamic(event);
+  const articulation = eventArticulation(event);
   const sourceInstrument = eventSourceInstrument(event);
 
   return Array.from({ length: attackCount }, (_, idx) => {
@@ -554,6 +620,7 @@ function expandedTremoloEvents(event, bps = currentBps()) {
     const expanded = [payload, beat + idx * intervalBeats, intervalBeats];
     if (pedalRelease !== null) expanded.push(pedalRelease);
     appendEventMetadata(expanded, dynamic);
+    appendEventMetadata(expanded, articulation);
     appendEventMetadata(expanded, sourceInstrument ? { type: 'instrument', instrument: sourceInstrument } : null);
     return expanded;
   });
@@ -875,7 +942,7 @@ class Accompanist {
         const current = this._currentBeat();
         if (current >= beat - 0.005) {
           const instr = eventSourceInstrument(this.events[this._lhIdx]) || this._instruments[0] || 'piano';
-          const duration = Math.max(0.12, (durationBeats ?? 0.75) / Math.max(0.5, this._bps));
+          const duration = eventDurationSeconds(this.events[this._lhIdx], instr, durationBeats ?? 0.75);
           const pedalRelease = eventPedalRelease(this.events[this._lhIdx]);
           playChord(pitches, eventVelocity(this.events[this._lhIdx]), instr, {
             duration,
@@ -931,6 +998,7 @@ let _noteHighwayBps = 1;
 let _finishPlaybackTimer = null;
 
 let _sheetMeasureEls = [];
+let _sheetMeasureMap = [];
 let _sheetHighlightRect = null;
 let _sheetHighlightIndex = -1;
 let _pendingSheetHighlightBeat = null;
@@ -2588,7 +2656,7 @@ async function fetchSheetHtmlEntry(name, variant, partsParam = '', options = {})
   const html = await resp.text();
   if (!html.includes('<svg')) throw new Error('Sheet rendering returned no SVG.');
   const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
-  const entry = { html, url };
+  const entry = { url };
   _sheetHtmlCache.set(cacheKey, entry);
   return entry;
 }
@@ -2745,7 +2813,7 @@ function updateSheetFingeringStatus() {
     badge.style.display = 'inline-flex';
     badge.dataset.state = 'ok';
     badge.textContent = 'Fingering available';
-    badge.title = 'Generate a beginner fingering version for this score.';
+    badge.title = 'Generate a beginner fingering version for the piano part.';
     generateBtn.style.display = 'inline-flex';
     generateBtn.disabled = false;
     generateBtn.textContent = 'Generate fingering';
@@ -2758,7 +2826,7 @@ function updateSheetFingeringStatus() {
     badge.dataset.state = 'warning';
     badge.textContent = 'Fingering unavailable';
     badge.title = !eligible
-      ? 'Automatic fingering is currently limited to scores with one or two parts.'
+      ? 'Automatic fingering is available for piano or keyboard parts.'
       : 'PianoPlayer is not installed in the backend environment.';
     return;
   }
@@ -3238,9 +3306,17 @@ async function selectPart(idx) {
 }
 
 function getInstrumentForPart(idx) {
-  return state.partInstruments[idx]
-    ?? state.current?.parts?.[idx]?.instrument
-    ?? 'piano';
+  if (state.partInstruments[idx]) return state.partInstruments[idx];
+  const part = state.current?.parts?.[idx];
+  const storedInstrument = part?.instrument || '';
+  const inferredInstrument = inferInstrumentFromPartName(part?.name);
+  if (
+    inferredInstrument &&
+    (!storedInstrument || ['piano', 'horn', 'cello', 'strings', 'voice'].includes(storedInstrument))
+  ) {
+    return inferredInstrument;
+  }
+  return storedInstrument || 'piano';
 }
 
 async function changeInstrument(partIdx, instrument) {
@@ -3305,12 +3381,41 @@ function getLeftHand() {
   return expandDynamicTremolos(getLeftHandRaw(), currentBps());
 }
 
+function readSheetMeasureMap(doc, measureCount) {
+  const fallback = Array.from({ length: measureCount }, (_unused, idx) => ({
+    startMeasure: idx,
+    endMeasure: idx + 1,
+  }));
+  const script = doc?.getElementById('notepilot-measure-map');
+  if (!script?.textContent) return fallback;
+  try {
+    const parsed = JSON.parse(script.textContent);
+    if (!Array.isArray(parsed)) return fallback;
+    return fallback.map((entry, idx) => {
+      const raw = parsed[idx] || {};
+      const startMeasure = Number(raw.startMeasure);
+      const endMeasure = Number(raw.endMeasure);
+      if (!Number.isFinite(startMeasure) || !Number.isFinite(endMeasure) || endMeasure <= startMeasure) {
+        return entry;
+      }
+      return {
+        startMeasure: Math.max(0, Math.floor(startMeasure)),
+        endMeasure: Math.max(Math.floor(startMeasure) + 1, Math.floor(endMeasure)),
+      };
+    });
+  } catch (error) {
+    console.warn('Could not parse sheet measure map:', error);
+    return fallback;
+  }
+}
+
 function initializeSheetHighlighting() {
   const frame = document.getElementById('sheet-frame');
   const doc = frame?.contentDocument;
   if (!doc) return;
 
   _sheetMeasureEls = [...doc.querySelectorAll('g.measure, g[class~="measure"], g[class*=" measure "]')];
+  _sheetMeasureMap = readSheetMeasureMap(doc, _sheetMeasureEls.length);
   _sheetHighlightRect = null;
   _sheetHighlightIndex = -1;
 
@@ -3342,10 +3447,14 @@ function initializeSheetHighlighting() {
   }
 
   _sheetMeasureEls.forEach((measureEl, idx) => {
+    const mapEntry = _sheetMeasureMap[idx] || { startMeasure: idx, endMeasure: idx + 1 };
+    const label = mapEntry.endMeasure > mapEntry.startMeasure + 1
+      ? `Jump to measures ${mapEntry.startMeasure + 1}-${mapEntry.endMeasure}`
+      : `Jump to measure ${mapEntry.startMeasure + 1}`;
     measureEl.classList.add('accompy-clickable-measure');
     measureEl.setAttribute('role', 'button');
     measureEl.setAttribute('tabindex', '0');
-    measureEl.setAttribute('aria-label', `Jump to measure ${idx + 1}`);
+    measureEl.setAttribute('aria-label', label);
     if (measureEl.dataset.notepilotJumpBound === '1') return;
     const jump = (event) => {
       event.preventDefault();
@@ -3368,13 +3477,14 @@ function initializeSheetHighlighting() {
 
 function clearSheetHighlight() {
   _sheetMeasureEls = [];
+  _sheetMeasureMap = [];
   _sheetHighlightRect?.remove();
   _sheetHighlightRect = null;
   _sheetHighlightIndex = -1;
   _pendingSheetHighlightBeat = null;
 }
 
-function measureIndexForBeat(beat) {
+function originalMeasureIndexForBeat(beat) {
   const starts = state.current?.measure_beats || [];
   if (!starts.length) return -1;
 
@@ -3383,13 +3493,30 @@ function measureIndexForBeat(beat) {
     if (starts[i] <= beat + 0.001) idx = i;
     else break;
   }
-  return Math.min(idx, _sheetMeasureEls.length - 1);
+  return idx;
+}
+
+function visibleMeasureIndexForOriginalIndex(originalIndex) {
+  if (originalIndex < 0) return -1;
+  const idx = _sheetMeasureMap.findIndex((entry) => (
+    originalIndex >= entry.startMeasure && originalIndex < entry.endMeasure
+  ));
+  return idx >= 0 ? idx : Math.min(originalIndex, _sheetMeasureEls.length - 1);
+}
+
+function measureIndexForBeat(beat) {
+  return visibleMeasureIndexForOriginalIndex(originalMeasureIndexForBeat(beat));
+}
+
+function sheetMeasureEntry(index) {
+  return _sheetMeasureMap[index] || { startMeasure: index, endMeasure: index + 1 };
 }
 
 function beatForMeasureIndex(measureIndex) {
   const starts = state.current?.measure_beats || [];
   if (!starts.length) return 0;
-  const idx = Math.max(0, Math.min(starts.length - 1, Number(measureIndex) || 0));
+  const entry = sheetMeasureEntry(Number(measureIndex) || 0);
+  const idx = Math.max(0, Math.min(starts.length - 1, entry.startMeasure));
   return Number(starts[idx]) || 0;
 }
 
@@ -3456,10 +3583,14 @@ function updateSheetHighlight(beat, options = {}) {
   }
   if (!bbox || bbox.width <= 0 || bbox.height <= 0) return;
   const starts = state.current?.measure_beats || [];
-  const measureStart = starts[idx] ?? 0;
-  const nextStart = starts[idx + 1];
-  const previousSpan = idx > 0 ? ((starts[idx] ?? 0) - (starts[idx - 1] ?? 0)) : 4;
-  const measureSpan = Math.max(0.25, (nextStart ?? (measureStart + previousSpan || 4)) - measureStart);
+  const mapEntry = sheetMeasureEntry(idx);
+  const startMeasure = Math.max(0, Math.min(starts.length - 1, mapEntry.startMeasure));
+  const endMeasure = Math.max(startMeasure + 1, Math.min(starts.length, mapEntry.endMeasure));
+  const measureStart = starts[startMeasure] ?? 0;
+  const nextStart = starts[endMeasure];
+  const previousSpan = startMeasure > 0 ? ((starts[startMeasure] ?? 0) - (starts[startMeasure - 1] ?? 0)) : 4;
+  const fallbackSpan = (previousSpan || 4) * Math.max(1, endMeasure - startMeasure);
+  const measureSpan = Math.max(0.25, (nextStart ?? (measureStart + fallbackSpan)) - measureStart);
   const progress = Math.max(0, Math.min(1, (beat - measureStart) / measureSpan));
   const barWidth = 14;
   const minX = bbox.x - 7;
@@ -4503,6 +4634,7 @@ function setImportStatus(message, tone = 'muted') {
   const status = document.getElementById('import-status');
   if (!status) return;
   status.textContent = message;
+  status.hidden = tone === 'muted';
   status.style.color = tone === 'error'
     ? '#e05c5c'
     : tone === 'success'
@@ -4510,7 +4642,34 @@ function setImportStatus(message, tone = 'muted') {
       : 'var(--muted)';
 }
 
-function setImportProgress({ visible = true, progress = 0, message = '', active = false } = {}) {
+function formatImportEta(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '';
+  const rounded = Math.max(1, Math.round(seconds));
+  if (rounded < 60) return `about ${rounded}s remaining`;
+  const minutes = Math.floor(rounded / 60);
+  const extraSeconds = rounded % 60;
+  if (minutes < 60) {
+    return extraSeconds
+      ? `about ${minutes}m ${extraSeconds}s remaining`
+      : `about ${minutes}m remaining`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const extraMinutes = minutes % 60;
+  return extraMinutes
+    ? `about ${hours}h ${extraMinutes}m remaining`
+    : `about ${hours}h remaining`;
+}
+
+function estimateImportEta(progress, startedAt, active) {
+  if (!active || !startedAt) return '';
+  const normalized = Math.max(0, Math.min(99, Number(progress) || 0));
+  const elapsedSeconds = (Date.now() - startedAt) / 1000;
+  if (elapsedSeconds < 3 || normalized < 3) return 'Estimating…';
+  const remainingSeconds = elapsedSeconds * ((100 - normalized) / normalized);
+  return formatImportEta(remainingSeconds) || 'Estimating…';
+}
+
+function setImportProgress({ visible = true, progress = 0, message = '', active = false, eta = '' } = {}) {
   const container = document.getElementById('import-progress');
   const fill = document.getElementById('import-progress-fill');
   const label = document.getElementById('import-progress-label');
@@ -4521,32 +4680,24 @@ function setImportProgress({ visible = true, progress = 0, message = '', active 
   container.classList.toggle('active', !!active);
   fill.style.width = `${normalized}%`;
   label.textContent = message || 'Working…';
-  percent.textContent = `${Math.round(normalized)}%`;
+  percent.textContent = eta ? `${Math.round(normalized)}% · ${eta}` : `${Math.round(normalized)}%`;
 }
 
-async function waitForImportJob(jobId) {
+async function waitForImportJob(jobId, startedAt = Date.now()) {
   let lastProgress = 0;
-  let lastMessage = '';
-  let messageStartedAt = Date.now();
   while (true) {
     const job = await api(`/api/import/jobs/${encodeURIComponent(jobId)}`);
     lastProgress = Math.max(lastProgress, Number(job.progress) || 0);
     const baseMessage = job.message || 'Importing…';
-    if (baseMessage !== lastMessage) {
-      lastMessage = baseMessage;
-      messageStartedAt = Date.now();
-    }
-    const elapsedSeconds = Math.floor((Date.now() - messageStartedAt) / 1000);
-    const message = elapsedSeconds >= 8 && (job.status === 'queued' || job.status === 'running')
-      ? `${baseMessage} (${elapsedSeconds}s)`
-      : baseMessage;
+    const active = job.status === 'queued' || job.status === 'running';
     setImportProgress({
       visible: true,
       progress: lastProgress,
-      message,
-      active: job.status === 'queued' || job.status === 'running',
+      message: baseMessage,
+      active,
+      eta: estimateImportEta(lastProgress, startedAt, active),
     });
-    setImportStatus(message);
+    setImportStatus(baseMessage);
 
     if (job.status === 'completed') return job.result;
     if (job.status === 'failed') throw new Error(job.error || job.message || 'Import failed');
@@ -4649,6 +4800,7 @@ async function importScoreFiles() {
   form.append('name', (nameInput?.value || '').trim());
 
   button.disabled = true;
+  const importStartedAt = Date.now();
   const isDirectScore = files.length === 1 && /\.(xml|mxl|musicxml|mscx|mscz)$/i.test(files[0].name || '');
   const isLilyPond = files.every((file) => /\.(ily|ly)$/i.test(file.name || ''))
     || (files.length === 1 && /\.zip$/i.test(files[0].name || ''));
@@ -4668,6 +4820,7 @@ async function importScoreFiles() {
         ? 'Uploading score file…'
         : 'Uploading for Audiveris…',
     active: true,
+    eta: 'Estimating…',
   });
 
   try {
@@ -4676,7 +4829,7 @@ async function importScoreFiles() {
     if (!response.ok) {
       throw new Error(payload.detail || 'Import failed');
     }
-    const result = await waitForImportJob(payload.id);
+    const result = await waitForImportJob(payload.id, importStartedAt);
     if (!result?.name) throw new Error('Import completed without a score name.');
     clearSheetHtmlCache(result.name);
     addScoreToLibrary(result.name);

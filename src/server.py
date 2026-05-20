@@ -30,19 +30,26 @@ from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 import requests
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Response
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel
 from src.env import load_local_env
 from src.convert_score import convert_lilypond_parts_to_musicxml, convert_score_source, render_html, slugify_score_name
-from src.fingering import apply_auto_fingering, normalize_fingering_state, stack_fingering_chord_numbers_in_html
+from src.fingering import (
+    apply_auto_fingering,
+    normalize_fingering_state,
+    piano_part_indices,
+    stack_fingering_chord_numbers_in_html,
+)
 from src.paths import get_static_dir
 from src.storage import create_score_store, SupabaseScoreStore, _score_row_to_payload
 
 load_local_env()
 
 app = FastAPI()
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 class SPAStaticFiles(StaticFiles):
@@ -446,6 +453,203 @@ def _filter_part_to_staves(part_el, selected_staves: set[int]):
                     attr_child.attrib["number"] = "1"
 
 
+def _measure_has_sounding_note(measure) -> bool:
+    for note_el in [child for child in list(measure) if _xml_local_name(child.tag) == "note"]:
+        if _musicxml_child(note_el, "pitch") is not None or _musicxml_child(note_el, "unpitched") is not None:
+            return True
+    return False
+
+
+def _measure_has_note(measure) -> bool:
+    return any(_xml_local_name(child.tag) == "note" for child in list(measure))
+
+
+def _measure_can_be_folded_after_start(measure) -> bool:
+    allowed = {"note", "backup", "forward", "print", "attributes", "barline"}
+    for child in list(measure):
+        local_name = _xml_local_name(child.tag)
+        if local_name == "note":
+            if _musicxml_child(child, "pitch") is not None or _musicxml_child(child, "unpitched") is not None:
+                return False
+            continue
+        if local_name not in allowed:
+            return False
+    return True
+
+
+def _ensure_measure_attributes(measure):
+    attributes = _musicxml_child(measure, "attributes")
+    if attributes is not None:
+        return attributes
+    attributes = ET.Element("attributes")
+    insert_at = 0
+    for idx, child in enumerate(list(measure)):
+        if _xml_local_name(child.tag) in {"print", "direction"}:
+            insert_at = idx + 1
+    measure.insert(insert_at, attributes)
+    return attributes
+
+
+def _measure_duration_from_context(measure, context: dict[str, int]) -> int:
+    attributes = _musicxml_child(measure, "attributes")
+    if attributes is not None:
+        divisions_text = _musicxml_child_text(attributes, "divisions")
+        if divisions_text:
+            try:
+                context["divisions"] = max(1, int(float(divisions_text)))
+            except ValueError:
+                pass
+        time_el = _musicxml_child(attributes, "time")
+        if time_el is not None:
+            beats_text = _musicxml_child_text(time_el, "beats")
+            beat_type_text = _musicxml_child_text(time_el, "beat-type")
+            try:
+                context["beats"] = max(1, int(float(beats_text or context["beats"])))
+                context["beat_type"] = max(1, int(float(beat_type_text or context["beat_type"])))
+            except ValueError:
+                pass
+    return max(1, round(context["divisions"] * context["beats"] * 4 / context["beat_type"]))
+
+
+def _measure_durations_by_part(measures_by_part) -> list[list[int]]:
+    durations_by_part = []
+    for measures in measures_by_part:
+        context = {"divisions": 1, "beats": 4, "beat_type": 4}
+        durations_by_part.append([
+            _measure_duration_from_context(measure, context)
+            for measure in measures
+        ])
+    return durations_by_part
+
+
+def _ensure_full_measure_rest(measure, duration: int):
+    if _measure_has_note(measure):
+        return
+    rest_note = ET.Element("note")
+    rest_el = ET.SubElement(rest_note, "rest", {"measure": "yes"})
+    rest_el.text = None
+    duration_el = ET.SubElement(rest_note, "duration")
+    duration_el.text = str(max(1, int(duration)))
+    voice_el = ET.SubElement(rest_note, "voice")
+    voice_el.text = "1"
+
+    insert_at = 0
+    for idx, child in enumerate(list(measure)):
+        if _xml_local_name(child.tag) in {"print", "attributes", "direction"}:
+            insert_at = idx + 1
+    measure.insert(insert_at, rest_note)
+
+
+def _reset_measure_to_full_rest(measure, duration: int):
+    for child in list(measure):
+        measure.remove(child)
+    _ensure_full_measure_rest(measure, duration)
+
+
+def _ensure_multiple_rest_marker(measure, count: int):
+    attributes = _ensure_measure_attributes(measure)
+    measure_style = _musicxml_child(attributes, "measure-style")
+    if measure_style is None:
+        measure_style = ET.Element("measure-style")
+        attributes.append(measure_style)
+    multiple_rest = _musicxml_child(measure_style, "multiple-rest")
+    if multiple_rest is None:
+        multiple_rest = ET.Element("multiple-rest", {"use-symbols": "yes"})
+        measure_style.append(multiple_rest)
+    multiple_rest.text = str(max(2, int(count)))
+
+
+def collapse_empty_musicxml_measures(xml_text: str, *, min_measures: int = 2, include_measure_map: bool = False):
+    try:
+        root = ET.fromstring(xml_text.encode("utf-8"))
+    except ET.ParseError:
+        return ("", []) if include_measure_map else ""
+
+    parts = [child for child in list(root) if _xml_local_name(child.tag) == "part"]
+    if not parts:
+        return (xml_text, []) if include_measure_map else xml_text
+
+    measures_by_part = [
+        [child for child in list(part) if _xml_local_name(child.tag) == "measure"]
+        for part in parts
+    ]
+    if not measures_by_part or not measures_by_part[0]:
+        return (xml_text, []) if include_measure_map else xml_text
+
+    measure_count = min(len(measures) for measures in measures_by_part)
+    durations_by_part = _measure_durations_by_part(measures_by_part)
+    foldable = []
+    for idx in range(measure_count):
+        measures_at_idx = [measures[idx] for measures in measures_by_part]
+        is_empty = all(not _measure_has_sounding_note(measure) for measure in measures_at_idx)
+        can_fold = idx == 0 or all(_measure_can_be_folded_after_start(measure) for measure in measures_at_idx)
+        foldable.append(is_empty and can_fold)
+
+    runs: list[tuple[int, int]] = []
+    idx = 0
+    while idx < measure_count:
+        if not foldable[idx]:
+            idx += 1
+            continue
+        start = idx
+        while idx < measure_count and foldable[idx]:
+            idx += 1
+        length = idx - start
+        if length >= max(2, min_measures):
+            runs.append((start, length))
+
+    if not runs:
+        measure_map = [
+            {"startMeasure": idx, "endMeasure": idx + 1}
+            for idx in range(measure_count)
+        ]
+        return (xml_text, measure_map) if include_measure_map else xml_text
+
+    for start, length in runs:
+        for part_idx, measures in enumerate(measures_by_part):
+            _ensure_full_measure_rest(measures[start], durations_by_part[part_idx][start])
+            _ensure_multiple_rest_marker(measures[start], length)
+            for hidden_idx in range(start + 1, start + length):
+                if hidden_idx < len(measures):
+                    _reset_measure_to_full_rest(
+                        measures[hidden_idx],
+                        durations_by_part[part_idx][hidden_idx],
+                    )
+
+    collapsed_ranges = {start: length for start, length in runs}
+    hidden_measure_indices = {
+        idx
+        for start, length in runs
+        for idx in range(start + 1, start + length)
+    }
+    measure_map = []
+    idx = 0
+    while idx < measure_count:
+        if idx in collapsed_ranges:
+            length = collapsed_ranges[idx]
+            measure_map.append({"startMeasure": idx, "endMeasure": idx + length})
+            idx += length
+            continue
+        if idx not in hidden_measure_indices:
+            measure_map.append({"startMeasure": idx, "endMeasure": idx + 1})
+        idx += 1
+
+    output = ET.tostring(root, encoding="unicode")
+    return (output, measure_map) if include_measure_map else output
+
+
+def inject_sheet_measure_map(html: str, measure_map: list[dict]) -> str:
+    if not measure_map:
+        return html
+    import json
+
+    payload = json.dumps(measure_map, separators=(",", ":"))
+    script = f'<script id="notepilot-measure-map" type="application/json">{payload}</script>'
+    if "</body>" in html:
+        return html.replace("</body>", f"{script}\n</body>", 1)
+    return html + script
+
+
 def filter_musicxml_parts(
     xml_text: str,
     part_indices: list[int] | None,
@@ -647,19 +851,31 @@ def build_fingered_score_variant(score: dict, progress_callback=None) -> tuple[s
         work_dir = Path(tmp_dir)
         base_path = work_dir / f"{score_name}.musicxml"
         progress(10, "Preparing MusicXML")
-        base_path.write_text(musicxml_source, encoding="utf-8")
+        parts_data = score.get("parts") or []
+        selected_piano_indices = piano_part_indices(parts_data)
+        fingering_source = musicxml_source
+        fingering_parts_data = parts_data
+        if selected_piano_indices and len(selected_piano_indices) < len(parts_data):
+            filtered_source = filter_musicxml_parts(musicxml_source, selected_piano_indices, parts_data)
+            if filtered_source:
+                fingering_source = filtered_source
+                fingering_parts_data = [
+                    parts_data[idx] for idx in selected_piano_indices if 0 <= idx < len(parts_data)
+                ]
+
+        base_path.write_text(fingering_source, encoding="utf-8")
 
         fingered_path, fingering = apply_auto_fingering(
             str(base_path),
             out_dir=str(work_dir),
             score_name=score_name,
-            parts_data=score.get("parts") or [],
+            parts_data=fingering_parts_data,
             progress_callback=progress,
         )
         if not fingering.get("applied"):
             reason = fingering.get("reason") or "generation_failed"
             if reason == "unsupported_parts":
-                detail = "Automatic fingering is currently limited to scores with one or two parts."
+                detail = "Automatic fingering is available for piano or keyboard parts."
             elif reason == "missing_dependency":
                 detail = "PianoPlayer is not installed in the backend environment."
             else:
@@ -1381,15 +1597,49 @@ def get_sheet(name: str, request: Request, variant: str = "base", parts: str | N
     cached_fingered_html = (score_data.get("fingered_sheet_html") or "").strip()
 
     def render_filtered_source(xml_source: str, *, stack_fingering_chords: bool = False) -> str:
-        filtered_source = filter_musicxml_parts(xml_source, part_indices, score_parts_meta)
+        filtered_source = ""
+        try:
+            filtered_source = filter_musicxml_parts(xml_source, part_indices, score_parts_meta)
+        except Exception as exc:
+            print(f"Could not filter sheet parts for {name}: {exc}")
         if not filtered_source:
-            return ""
-        return render_sheet_html_from_musicxml_text(
-            score.get("name") or name,
-            title,
-            filtered_source,
-            stack_fingering_chords=stack_fingering_chords,
-        )
+            filtered_source = xml_source if not part_indices else ""
+        measure_map = []
+        if part_indices:
+            try:
+                collapsed_source, measure_map = collapse_empty_musicxml_measures(
+                    filtered_source,
+                    include_measure_map=True,
+                )
+                filtered_source = collapsed_source or filtered_source
+            except Exception as exc:
+                print(f"Could not collapse empty selected-part measures for {name}: {exc}")
+                measure_map = []
+        html = ""
+        if filtered_source:
+            try:
+                html = render_sheet_html_from_musicxml_text(
+                    score.get("name") or name,
+                    title,
+                    filtered_source,
+                    stack_fingering_chords=stack_fingering_chords,
+                )
+            except Exception as exc:
+                print(f"Could not render MusicXML sheet for {name}: {exc}")
+        if (not html or "<svg" not in html) and part_indices:
+            try:
+                synthetic_source = synthesize_selected_parts_musicxml(score, part_indices, title)
+                if synthetic_source:
+                    html = render_sheet_html_from_musicxml_text(
+                        score.get("name") or name,
+                        title,
+                        synthetic_source,
+                        stack_fingering_chords=stack_fingering_chords,
+                    )
+                    measure_map = []
+            except Exception as exc:
+                print(f"Could not render synthesized selected sheet for {name}: {exc}")
+        return inject_sheet_measure_map(html, measure_map)
 
     if variant == "fingered":
         html = ""

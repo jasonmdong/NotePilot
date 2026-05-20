@@ -22,22 +22,79 @@ import subprocess
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
-from music21 import converter, note, chord, expressions, pitch, dynamics as m21dynamics, stream, meter, metadata
+from music21 import (
+    articulations as m21articulations,
+    converter,
+    note,
+    chord,
+    expressions,
+    pitch,
+    dynamics as m21dynamics,
+    stream,
+    meter,
+    metadata,
+)
 from src.fingering import build_fingering_state
 from src.paths import get_scores_dir
 
 MUSESCORE_SUFFIXES = {".mscx", ".mscz"}
 LILYPOND_SUFFIXES = {".ily", ".ly"}
 GRACE_NOTE_BEATS = 0.125
+MUSESCORE_DYNAMIC_VELOCITY = {
+    "n": 49,
+    "pppppp": 1,
+    "ppppp": 5,
+    "pppp": 10,
+    "ppp": 16,
+    "pp": 33,
+    "p": 49,
+    "mp": 64,
+    "mf": 80,
+    "f": 96,
+    "ff": 112,
+    "fff": 126,
+    "ffff": 127,
+    "fffff": 127,
+    "ffffff": 127,
+    "sf": 112,
+    "sfz": 112,
+    "sff": 126,
+    "sffz": 126,
+    "sfff": 127,
+    "sfffz": 127,
+    "rfz": 112,
+    "rf": 112,
+    "fz": 112,
+    "m": 96,
+    "r": 112,
+    "s": 112,
+    "z": 80,
+}
 DYNAMIC_VELOCITY = {
-    "ppp": 0.22,
-    "pp": 0.30,
-    "p": 0.38,
-    "mp": 0.48,
-    "mf": 0.60,
-    "f": 0.74,
-    "ff": 0.88,
-    "fff": 1.00,
+    mark: value / 127.0 for mark, value in MUSESCORE_DYNAMIC_VELOCITY.items()
+}
+DYNAMIC_ORDINARY = {
+    "n", "pppppp", "ppppp", "pppp", "ppp", "pp", "p", "mp", "mf", "f", "ff", "fff", "ffff", "fffff", "ffffff"
+}
+DYNAMIC_SINGLE_NOTE = {"sf", "sfz", "sff", "sffz", "sfff", "sfffz", "rfz", "rf", "fz", "m", "r", "s"}
+DYNAMIC_COMPOUND = {
+    "fp": ("f", "p"),
+    "pf": ("p", "f"),
+    "sfp": ("f", "p"),
+    "sfpp": ("f", "pp"),
+}
+DYNAMIC_RAMP_STEP = 16 / 127.0
+DYNAMIC_DEFAULT_VELOCITY = DYNAMIC_VELOCITY["mf"]
+COMPOUND_DYNAMIC_BEATS = 0.8
+
+ARTICULATION_PLAYBACK = {
+    "accent": {"velocityScale": 1.18},
+    "strong-accent": {"velocityScale": 1.28, "durationScale": 0.95},
+    "staccato": {"durationScale": 0.52},
+    "staccatissimo": {"durationScale": 0.32},
+    "spiccato": {"durationScale": 0.42, "velocityScale": 0.95},
+    "tenuto": {"durationScale": 1.08, "velocityScale": 1.04},
+    "detached-legato": {"durationScale": 0.72},
 }
 
 
@@ -98,28 +155,185 @@ def _dynamic_marks(container, anchor=None) -> list[tuple[float, str, float]]:
     marks = []
     for dynamic in container.recurse().getElementsByClass(m21dynamics.Dynamic):
         value = str(getattr(dynamic, "value", "") or "").lower()
-        if value not in DYNAMIC_VELOCITY:
+        if value not in DYNAMIC_VELOCITY and value not in DYNAMIC_COMPOUND:
             continue
+        velocity = (
+            _dynamic_velocity(DYNAMIC_COMPOUND[value][0])
+            if value in DYNAMIC_COMPOUND
+            else DYNAMIC_VELOCITY[value]
+        )
         try:
             beat = float(dynamic.getOffsetInHierarchy(anchor))
         except Exception:
             beat = float(getattr(dynamic, "offset", 0.0) or 0.0)
-        marks.append((beat, value, DYNAMIC_VELOCITY[value]))
+        marks.append((beat, value, velocity))
     marks.sort(key=lambda item: item[0])
     return marks
 
 
-def _dynamic_at_beat(dynamic_marks: list[tuple[float, str, float]], beat: float) -> dict | None:
-    active = None
-    for mark_beat, value, velocity in dynamic_marks:
-        if mark_beat <= beat + 0.0001:
-            active = (value, velocity)
+def _dynamic_velocity(mark: str) -> float:
+    return DYNAMIC_VELOCITY.get(mark, DYNAMIC_DEFAULT_VELOCITY)
+
+
+def _dynamic_curve_progress(progress: float, method: str = "normal") -> float:
+    progress = max(0.0, min(1.0, progress))
+    if method == "ease-in":
+        return progress * progress
+    if method == "ease-out":
+        return 1 - (1 - progress) * (1 - progress)
+    if method == "ease-in-out":
+        return progress * progress * (3 - 2 * progress)
+    return progress
+
+
+def _dynamic_wedges(container, anchor=None) -> list[dict]:
+    anchor = anchor or container
+    wedges = []
+    for wedge in container.recurse().getElementsByClass(m21dynamics.DynamicWedge):
+        try:
+            spanned = list(wedge.getSpannedElements())
+        except Exception:
+            spanned = []
+        if len(spanned) >= 2:
+            try:
+                start = float(spanned[0].getOffsetInHierarchy(anchor))
+                end = float(spanned[-1].getOffsetInHierarchy(anchor))
+            except Exception:
+                start = float(getattr(spanned[0], "offset", 0.0) or 0.0)
+                end = float(getattr(spanned[-1], "offset", start) or start)
+            end += float(getattr(spanned[-1], "quarterLength", 0.0) or 0.0)
+        else:
+            start = float(getattr(wedge, "offset", 0.0) or 0.0)
+            end = start + float(getattr(wedge, "quarterLength", 0.0) or 0.0)
+        if end <= start + 0.0001:
             continue
+        direction = -1 if isinstance(wedge, m21dynamics.Diminuendo) else 1
+        wedges.append({"start": start, "end": end, "direction": direction})
+    wedges.sort(key=lambda item: (item["start"], item["end"]))
+    return wedges
+
+
+def _dynamic_mark_after(
+    dynamic_marks: list[tuple[float, str, float]],
+    beat: float,
+    *,
+    ordinary_only: bool = False,
+) -> tuple[str, float] | None:
+    for mark_beat, value, velocity in dynamic_marks:
+        if mark_beat >= beat - 0.0001:
+            if ordinary_only and value not in DYNAMIC_ORDINARY:
+                continue
+            return value, velocity
+    return None
+
+
+def _dynamic_baseline_at(dynamic_marks: list[tuple[float, str, float]], beat: float) -> tuple[str | None, float | None]:
+    active: tuple[str | None, float | None] = (None, None)
+    for mark_beat, value, velocity in dynamic_marks:
+        if mark_beat > beat + 0.0001:
+            break
+        if value in DYNAMIC_ORDINARY:
+            active = (value, velocity)
+        elif value in DYNAMIC_COMPOUND:
+            _start, end = DYNAMIC_COMPOUND[value]
+            if beat >= mark_beat + COMPOUND_DYNAMIC_BEATS - 0.0001:
+                active = (end, _dynamic_velocity(end))
+        elif value in DYNAMIC_SINGLE_NOTE and abs(mark_beat - beat) <= 0.0001:
+            return value, velocity
+    return active
+
+
+def _dynamic_at_beat(
+    dynamic_marks: list[tuple[float, str, float]],
+    dynamic_wedges: list[dict],
+    beat: float,
+) -> dict | None:
+    mark, velocity = _dynamic_baseline_at(dynamic_marks, beat)
+    for mark_beat, value, _velocity in dynamic_marks:
+        if value not in DYNAMIC_COMPOUND:
+            continue
+        if not (mark_beat - 0.0001 <= beat <= mark_beat + COMPOUND_DYNAMIC_BEATS + 0.0001):
+            continue
+        start_mark, end_mark = DYNAMIC_COMPOUND[value]
+        start_velocity = _dynamic_velocity(start_mark)
+        end_velocity = _dynamic_velocity(end_mark)
+        progress = _dynamic_curve_progress((beat - mark_beat) / COMPOUND_DYNAMIC_BEATS)
+        velocity = start_velocity + (end_velocity - start_velocity) * progress
+        mark = value
         break
-    if active is None:
+
+    for wedge in dynamic_wedges:
+        start = float(wedge["start"])
+        end = float(wedge["end"])
+        if not (start - 0.0001 <= beat <= end + 0.0001):
+            continue
+        _start_mark, start_velocity = _dynamic_baseline_at(dynamic_marks, start)
+        if start_velocity is None:
+            start_velocity = DYNAMIC_DEFAULT_VELOCITY
+        next_mark = _dynamic_mark_after(dynamic_marks, end, ordinary_only=True)
+        if next_mark is not None:
+            end_velocity = next_mark[1]
+        else:
+            end_velocity = start_velocity + DYNAMIC_RAMP_STEP * (1 if wedge["direction"] > 0 else -1)
+        if wedge["direction"] > 0:
+            end_velocity = max(end_velocity, start_velocity + 0.04)
+        else:
+            end_velocity = min(end_velocity, start_velocity - 0.04)
+        progress = _dynamic_curve_progress((beat - start) / max(0.0001, end - start))
+        velocity = start_velocity + (end_velocity - start_velocity) * progress
+        mark = "crescendo" if wedge["direction"] > 0 else "diminuendo"
+        break
+    if velocity is None:
         return None
-    value, velocity = active
-    return {"type": "dynamic", "mark": value, "velocity": velocity}
+    velocity = max(0.08, min(1.0, velocity))
+    if mark in DYNAMIC_VELOCITY:
+        return {"type": "dynamic", "mark": mark, "velocity": velocity}
+    return {"type": "dynamic", "mark": mark or "dynamic", "velocity": velocity}
+
+
+def _articulation_name(articulation) -> str | None:
+    if isinstance(articulation, m21articulations.StrongAccent):
+        return "strong-accent"
+    if isinstance(articulation, m21articulations.Accent):
+        return "accent"
+    if isinstance(articulation, m21articulations.Staccatissimo):
+        return "staccatissimo"
+    if isinstance(articulation, m21articulations.Staccato):
+        return "staccato"
+    if isinstance(articulation, m21articulations.Spiccato):
+        return "spiccato"
+    if isinstance(articulation, m21articulations.Tenuto):
+        return "tenuto"
+    if isinstance(articulation, m21articulations.DetachedLegato):
+        return "detached-legato"
+    name = articulation.__class__.__name__.lower()
+    return name if name in ARTICULATION_PLAYBACK else None
+
+
+def _articulations_for_event(el) -> list[str]:
+    names = []
+    for articulation in getattr(el, "articulations", []) or []:
+        name = _articulation_name(articulation)
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _combined_articulation_payload(articulations: list[str]) -> dict | None:
+    if not articulations:
+        return None
+    duration_scale = 1.0
+    velocity_scale = 1.0
+    for name in articulations:
+        playback = ARTICULATION_PLAYBACK.get(name) or {}
+        duration_scale *= float(playback.get("durationScale", 1.0))
+        velocity_scale *= float(playback.get("velocityScale", 1.0))
+    return {
+        "type": "articulation",
+        "names": articulations,
+        "durationScale": max(0.2, min(1.25, duration_scale)),
+        "velocityScale": max(0.6, min(1.6, velocity_scale)),
+    }
 
 
 def _tremolo_marks(number_of_marks) -> int:
@@ -175,14 +389,24 @@ def _attack_duration(part, el) -> float:
     return float(getattr(el, "quarterLength", 0.0) or 0.0)
 
 
-def _add_grouped_event(grouped: dict, beat: float, pitches: list[int], duration: float, ornament: dict | None = None):
+def _add_grouped_event(
+    grouped: dict,
+    beat: float,
+    pitches: list[int],
+    duration: float,
+    ornament: dict | None = None,
+    articulations: list[str] | None = None,
+):
     if not pitches:
         return
-    slot = grouped.setdefault(beat, {"pitches": [], "duration": 0.0, "ornaments": []})
+    slot = grouped.setdefault(beat, {"pitches": [], "duration": 0.0, "ornaments": [], "articulations": []})
     slot["pitches"].extend(pitches)
     slot["duration"] = max(slot["duration"], duration)
     if ornament:
         slot["ornaments"].append(ornament)
+    for articulation in articulations or []:
+        if articulation not in slot["articulations"]:
+            slot["articulations"].append(articulation)
 
 
 def _iter_tremolo_attacks(start: float, end: float, interval: float, pitch_groups: list[list[int]]):
@@ -312,6 +536,7 @@ def extract_events(part, pedal_spans: list[tuple[float, float]] | None = None) -
     """
     grouped = {}
     dynamic_marks = _dynamic_marks(part)
+    dynamic_wedges = _dynamic_wedges(part)
     flat_events = list(part.flatten().notesAndRests)
     grace_counts_by_beat = {}
     grace_index_by_id = {}
@@ -345,6 +570,7 @@ def extract_events(part, pedal_spans: list[tuple[float, float]] | None = None) -
                 playback_start(el),
                 _pitches_for_attack(el),
                 GRACE_NOTE_BEATS,
+                articulations=_articulations_for_event(el),
             )
             continue
 
@@ -368,6 +594,7 @@ def extract_events(part, pedal_spans: list[tuple[float, float]] | None = None) -
                     "marks": _tremolo_marks(getattr(tremolo_spanner, "numberOfMarks", 3)),
                     "groups": pitch_groups,
                 },
+                _articulations_for_event(spanned[0]),
             )
             continue
 
@@ -381,7 +608,7 @@ def extract_events(part, pedal_spans: list[tuple[float, float]] | None = None) -
             interval = max(0.0625, float(getattr(trill, "quarterLength", 0.125) or 0.125))
             pitch_groups = _trill_pitch_groups(el, trill, flat_events, event_idx)
             for beat, attack_pitches, duration in _iter_tremolo_attacks(start, end, interval, pitch_groups):
-                _add_grouped_event(grouped, beat, attack_pitches, duration)
+                _add_grouped_event(grouped, beat, attack_pitches, duration, articulations=_articulations_for_event(el))
             continue
 
         tremolo = _single_tremolo(el)
@@ -399,18 +626,31 @@ def extract_events(part, pedal_spans: list[tuple[float, float]] | None = None) -
                     "marks": _tremolo_marks(getattr(tremolo, "numberOfMarks", 3)),
                     "groups": [pitches],
                 },
+                _articulations_for_event(el),
             )
             continue
 
         if isinstance(el, note.Note):
             if _starts_new_attack(el):
                 beat = playback_start(el)
-                _add_grouped_event(grouped, beat, [el.pitch.midi], _note_tie_duration(part, el))
+                _add_grouped_event(
+                    grouped,
+                    beat,
+                    [el.pitch.midi],
+                    _note_tie_duration(part, el),
+                    articulations=_articulations_for_event(el),
+                )
         elif isinstance(el, chord.Chord):
             pitches = _pitches_for_attack(el)
             if pitches:
                 beat = playback_start(el)
-                _add_grouped_event(grouped, beat, pitches, _attack_duration(part, el))
+                _add_grouped_event(
+                    grouped,
+                    beat,
+                    pitches,
+                    _attack_duration(part, el),
+                    articulations=_articulations_for_event(el),
+                )
 
     events = []
     for beat in sorted(grouped.keys()):
@@ -423,7 +663,12 @@ def extract_events(part, pedal_spans: list[tuple[float, float]] | None = None) -
         ornaments = grouped[beat].get("ornaments") or []
         if ornaments:
             event.extend([None, ornaments[0] if len(ornaments) == 1 else ornaments])
-        dynamic = _dynamic_at_beat(dynamic_marks, beat)
+        articulation = _combined_articulation_payload(grouped[beat].get("articulations") or [])
+        if articulation:
+            if len(event) == 3:
+                event.append(None)
+            event.append(articulation)
+        dynamic = _dynamic_at_beat(dynamic_marks, dynamic_wedges, beat)
         if dynamic:
             if len(event) == 3:
                 event.append(None)
@@ -1042,6 +1287,17 @@ def _read_musicxml_text(source: str) -> str:
         return f.read()
 
 
+def _materialize_musicxml_text_source(source: str, out_dir: str, score_name: str) -> str:
+    if not zipfile.is_zipfile(source):
+        return source
+    output_path = os.path.join(out_dir, f"{score_name}__extracted.musicxml")
+    xml_text = _read_musicxml_text(source)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(xml_text)
+    return output_path
+
+
 def _write_musicxml_without_harmony_functions(source: str, output_path: str) -> int:
     xml_text = _read_musicxml_text(source)
     sanitized_xml, removed_count = _remove_harmony_functions(xml_text)
@@ -1123,6 +1379,7 @@ def convert_score_source(source: str, *, name: str | None = None, out_dir: str |
             render_source_path = score.write("musicxml", fp=normalized_musicxml)
         except Exception:
             render_source_path = mxl_path
+    render_source_path = _materialize_musicxml_text_source(str(render_source_path), out_dir, score_name)
 
     write_score_py(parts_data, out_py, title, source_ref=source, measure_beats=measure_beats)
     render_html(str(render_source_path), out_html, title)
@@ -1155,21 +1412,42 @@ def _detect_instrument(part) -> str:
         ("piano", "piano"),
         ("contrabass", "contrabass"),
         ("contrabasses", "contrabass"),
+        ("contrabassi", "contrabass"),
         ("double bass", "contrabass"),
+        ("bassi", "contrabass"),
+        ("basso", "contrabass"),
         ("violin", "violin"),
+        ("violino", "violin"),
         ("viola", "viola"),
         ("cello", "cello"),
         ("violoncello", "cello"),
         ("bassoon", "bassoon"),
+        ("fagotti", "bassoon"),
+        ("fagotto", "bassoon"),
         ("trumpet", "trumpet"),
+        ("trombe", "trumpet"),
+        ("tromba", "trumpet"),
+        ("trombone", "trombone"),
+        ("tromboni", "trombone"),
+        ("trombono", "trombone"),
+        ("tuba", "tuba"),
+        ("timpani", "timpani"),
+        ("timpano", "timpani"),
         ("horn", "horn"),
+        ("corni", "horn"),
+        ("corno", "horn"),
         ("clarinet", "clarinet"),
+        ("clarinetti", "clarinet"),
+        ("clarinetto", "clarinet"),
         ("flute", "flute"),
+        ("flauti", "flute"),
+        ("flauto", "flute"),
         ("oboe", "oboe"),
-        ("bass", "cello"),
+        ("oboi", "oboe"),
         ("soprano", "flute"),
         ("alto", "clarinet"),
         ("tenor", "violin"),
+        ("bass", "contrabass"),
     ]:
         if kw in name:
             return result
@@ -1205,8 +1483,14 @@ def _detect_instrument(part) -> str:
         return "bassoon"
     if isinstance(instr, (m21i.Trumpet,)):
         return "trumpet"
+    if isinstance(instr, (m21i.Trombone,)):
+        return "trombone"
+    if isinstance(instr, (m21i.Tuba,)):
+        return "tuba"
     if isinstance(instr, (m21i.Horn,)):
         return "horn"
+    if isinstance(instr, (m21i.Timpani,)):
+        return "timpani"
     if isinstance(instr, m21i.WoodwindInstrument):
         return "clarinet"
     if isinstance(instr, m21i.BrassInstrument):
