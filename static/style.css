@@ -438,6 +438,10 @@ body.auth-mode .score-grid {
   margin-bottom: 1rem;
 }
 
+.landing-kicker:empty {
+  display: none;
+}
+
 .landing-copy h1 {
   font-size: clamp(3rem, 8vw, 6.8rem);
   line-height: 1.02;

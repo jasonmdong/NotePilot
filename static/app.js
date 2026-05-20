@@ -935,6 +935,7 @@ let _sheetHighlightRect = null;
 let _sheetHighlightIndex = -1;
 let _pendingSheetHighlightBeat = null;
 let _sheetRenderSeq = 0;
+const _sheetHtmlCache = new Map();
 let _fingeringJobPollTimer = null;
 const SCORE_LIBRARY_KEY = 'accompy_score_library_v1';
 const SCORE_LIBRARY_INIT_KEY = 'accompy_score_library_initialized_v1';
@@ -2556,6 +2557,42 @@ function selectedSheetPartsParam() {
   return selectedSheetPartIndices().join(',');
 }
 
+function sheetHtmlCacheKey(name, variant, partsParam = '') {
+  return [name || '', variant || 'base', partsParam || 'full'].join('::');
+}
+
+function clearSheetHtmlCache(scoreName = null) {
+  const clearEntry = (key) => {
+    const entry = _sheetHtmlCache.get(key);
+    if (entry?.url) URL.revokeObjectURL(entry.url);
+    _sheetHtmlCache.delete(key);
+  };
+  if (!scoreName) {
+    [..._sheetHtmlCache.keys()].forEach(clearEntry);
+    return;
+  }
+  const prefix = `${scoreName}::`;
+  [..._sheetHtmlCache.keys()].forEach((key) => {
+    if (key.startsWith(prefix)) clearEntry(key);
+  });
+}
+
+async function fetchSheetHtmlEntry(name, variant, partsParam = '', options = {}) {
+  const cacheKey = sheetHtmlCacheKey(name, variant, partsParam);
+  if (!options.force && _sheetHtmlCache.has(cacheKey)) return _sheetHtmlCache.get(cacheKey);
+
+  const query = new URLSearchParams({ variant: variant || 'base' });
+  if (partsParam) query.set('parts', partsParam);
+  const resp = await fetch(`/api/scores/${encodeURIComponent(name)}/sheet?${query.toString()}`);
+  if (!resp.ok) throw new Error(await resp.text());
+  const html = await resp.text();
+  if (!html.includes('<svg')) throw new Error('Sheet rendering returned no SVG.');
+  const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+  const entry = { html, url };
+  _sheetHtmlCache.set(cacheKey, entry);
+  return entry;
+}
+
 function updateSheetDisplayModeUI() {
   const selectedMode = state.sheetDisplayMode === 'selected';
   const fullBtn = document.getElementById('sheet-display-full');
@@ -2609,7 +2646,9 @@ function filterMusicXmlParts(xmlText, partIndices) {
     );
     if (!selectedIds.size) return xmlText;
     [...partList.children].forEach((child) => {
-      if (child.localName === 'score-part' && !selectedIds.has(child.getAttribute('id'))) {
+      if (child.localName === 'part-group') {
+        partList.removeChild(child);
+      } else if (child.localName === 'score-part' && !selectedIds.has(child.getAttribute('id'))) {
         partList.removeChild(child);
       }
     });
@@ -2743,6 +2782,7 @@ async function pollFingeringJob(scoreName, jobId) {
       if (job.status === 'completed') {
         clearFingeringJobPolling();
         setFingeringJob(null);
+        clearSheetHtmlCache(scoreName);
         state.sheetVariant = 'fingered';
         await openScore(scoreName, {
           preserveSelectedPart: true,
@@ -2788,6 +2828,8 @@ async function renderScoreSheet() {
   musicXmlFallback.innerHTML = '';
   frame.style.display = 'none';
   frame.onload = null;
+  frame.removeAttribute('src');
+  frame.srcdoc = '';
   _sheetMeasureEls = [];
   _sheetHighlightRect?.remove();
   _sheetHighlightRect = null;
@@ -2811,60 +2853,35 @@ async function renderScoreSheet() {
     initializeSheetHighlighting();
   };
 
-  if (sheetPartIndices.length && assets.hasSheet && !data.guest) {
-    const query = new URLSearchParams({
-      variant: assets.variant,
-      v: String(renderSeq),
-      parts: sheetPartsParam,
-    });
-    const sheetUrl = `/api/scores/${encodeURIComponent(data.name)}/sheet?${query.toString()}`;
+  const showSheetHtmlEntry = (entry) => {
+    if (renderSeq !== _sheetRenderSeq || state.current?.name !== scoreName) return false;
+    if (!entry?.url) return false;
+    frame.addEventListener('load', finalizeFrame, { once: true });
+    frame.removeAttribute('srcdoc');
+    frame.src = entry.url;
+    frame.style.display = 'block';
+    placeholder.style.display = 'none';
+    requestAnimationFrame(finalizeFrame);
+    return true;
+  };
+
+  if (assets.hasSheet && !data.guest) {
     try {
-      const resp = await fetch(sheetUrl, { cache: 'no-store' });
-      if (!resp.ok) throw new Error(await resp.text());
-      const html = await resp.text();
-      if (renderSeq !== _sheetRenderSeq || state.current?.name !== scoreName) return;
-      if (!html.includes('<svg')) throw new Error('Selected part rendering returned no SVG.');
-      frame.addEventListener('load', finalizeFrame, { once: true });
-      frame.removeAttribute('src');
-      frame.srcdoc = html;
-      frame.style.display = 'block';
-      placeholder.style.display = 'none';
-      requestAnimationFrame(finalizeFrame);
-      return;
+      const entry = await fetchSheetHtmlEntry(data.name, assets.variant, sheetPartsParam);
+      if (showSheetHtmlEntry(entry)) return;
     } catch (error) {
-      console.warn(`Selected sheet render failed for ${data.name}`, error);
+      console.warn(`Sheet render failed for ${data.name} (${assets.variant}, parts=${sheetPartsParam || 'full'})`, error);
       if (renderSeq !== _sheetRenderSeq || state.current?.name !== scoreName) return;
-      frame.srcdoc = '';
-      frame.removeAttribute('src');
-      placeholder.style.display = 'block';
-      placeholder.textContent = 'Selected-parts sheet view is unavailable for this score. Use Full to see the original sheet.';
-      clearSheetHighlight();
-      return;
+
+      if (sheetPartsParam) {
+        const fullKey = sheetHtmlCacheKey(data.name, assets.variant, '');
+        const fullEntry = _sheetHtmlCache.get(fullKey);
+        if (fullEntry && showSheetHtmlEntry(fullEntry)) return;
+      }
     }
   }
 
-  if (assets.hasSheet && !(data.guest && assets.musicXml)) {
-    const query = new URLSearchParams({
-      variant: assets.variant,
-      v: String(renderSeq),
-    });
-    if (sheetPartsParam) query.set('parts', sheetPartsParam);
-    const sheetUrl = `/api/scores/${encodeURIComponent(data.name)}/sheet?${query.toString()}`;
-    try {
-      if (renderSeq !== _sheetRenderSeq || state.current?.name !== scoreName) return;
-      frame.addEventListener('load', finalizeFrame, { once: true });
-      frame.removeAttribute('srcdoc');
-      frame.src = sheetUrl;
-      frame.style.display = 'block';
-      placeholder.style.display = 'none';
-      requestAnimationFrame(finalizeFrame);
-      return;
-    } catch (error) {
-      console.warn(`Sheet render failed for ${data.name} (${assets.variant})`, error);
-      if (renderSeq !== _sheetRenderSeq || state.current?.name !== scoreName) return;
-    }
-  }
-
+  frame.removeAttribute('src');
   frame.srcdoc = '';
   const fallbackXml = assets.musicXml
     ? filterMusicXmlParts(assets.musicXml, sheetPartIndices)
@@ -2873,8 +2890,15 @@ async function renderScoreSheet() {
     ? await renderMusicXmlFallback(fallbackXml)
     : false;
   if (renderSeq !== _sheetRenderSeq || state.current?.name !== scoreName) return;
-  placeholder.style.display = 'none';
-  placeholder.textContent = '';
+  if (renderedFallback) {
+    placeholder.style.display = 'none';
+    placeholder.textContent = '';
+  } else {
+    placeholder.style.display = 'block';
+    placeholder.textContent = sheetPartsParam
+      ? 'Selected-parts sheet view is unavailable for this score. Switch to Full or change the selected parts.'
+      : 'No sheet music available for this score.';
+  }
   clearSheetHighlight();
 }
 
@@ -4337,12 +4361,14 @@ async function deleteScore(e, name) {
   }
   if (_appConfig.auth_enabled) {
     if (!await confirmDialog({ title: 'Delete piece?', message: `Delete "${formatName(name)}" from this account? This cannot be undone.` })) return;
-    await api(`/api/scores/${name}`, { method: 'DELETE' });
+    await api(`/api/scores/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    clearSheetHtmlCache(name);
     localStorage.removeItem(`accompy_score_v2_${_authUser?.id || _authUser?.username || 'auth'}_${name}`);
     await loadScoreList();
     return;
   }
   if (!await confirmDialog({ title: 'Remove piece?', message: `Remove "${formatName(name)}" from this browser's list?`, confirmText: 'Remove' })) return;
+  clearSheetHtmlCache(name);
   removeScoreFromLibrary(name);
   await loadScoreList();
 }
@@ -4601,6 +4627,7 @@ async function addPiece(corpusPath, safeName) {
     item.classList.add('done');
     item.querySelector('button').textContent = 'Added';
     item.querySelector('button').disabled = true;
+    clearSheetHtmlCache(safeName);
     addScoreToLibrary(safeName);
 
     // Refresh score list in background
@@ -4657,6 +4684,7 @@ async function importScoreFiles() {
     }
     const result = await waitForImportJob(payload.id);
     if (!result?.name) throw new Error('Import completed without a score name.');
+    clearSheetHtmlCache(result.name);
     addScoreToLibrary(result.name);
     setImportProgress({ visible: true, progress: 100, message: 'Import complete', active: false });
     setImportStatus(`Imported ${formatName(result.name)}.`, 'success');

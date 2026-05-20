@@ -306,7 +306,10 @@ def filter_musicxml_parts(xml_text: str, part_indices: list[int] | None) -> str:
         return xml_text
 
     for child in list(part_list):
-        if _xml_local_name(child.tag) == "score-part" and child.attrib.get("id") not in selected_ids:
+        local_name = _xml_local_name(child.tag)
+        if local_name == "part-group":
+            part_list.remove(child)
+        elif local_name == "score-part" and child.attrib.get("id") not in selected_ids:
             part_list.remove(child)
 
     for child in list(root):
@@ -1230,7 +1233,7 @@ def get_sheet(name: str, request: Request, variant: str = "base", parts: str | N
     if not html or "<svg" not in html:
         raise HTTPException(status_code=404, detail="No sheet music for this score")
     html = re.sub(r"\s*<h1>.*?</h1>\s*", "\n", html, count=1, flags=re.IGNORECASE | re.DOTALL)
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/scores/{name}/fingering/generate")
